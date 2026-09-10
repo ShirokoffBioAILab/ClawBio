@@ -113,6 +113,7 @@ def test_every_allow_listed_operation_is_actually_reachable():
     source = (
         (SKILL_DIR / "healthomics_bridge.py").read_text(encoding="utf-8")
         + (SKILL_DIR / "registration.py").read_text(encoding="utf-8")
+        + (SKILL_DIR / "monitoring.py").read_text(encoding="utf-8")
     )
     for operation in ALLOWED_OPERATIONS:
         assert f'"{operation}"' in source, (
@@ -1212,6 +1213,7 @@ def test_params_template_writes_json_skeleton(tmp_path):
 
 
 def test_output_verification_writes_outputs_and_handoff_json(tmp_path):
+    (tmp_path / "result.vcf").write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
     data = bridge.map_run_report(
         {
             "run": {"id": "7", "status": "COMPLETED", "workflowId": "wf", "outputUri": "s3://b/out/"},

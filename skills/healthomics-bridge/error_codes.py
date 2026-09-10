@@ -21,6 +21,10 @@ ERROR_PATTERNS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
 
 def error_code_for_exception(exc: BaseException) -> str:
     """Map an exception message to a stable, machine-readable code."""
+    aws = getattr(exc, "response", {}).get("Error", {}).get("Code")
+    if aws:
+        # Preserve service codes instead of calling all AccessDenied errors S3 errors.
+        return str(aws)
     text = str(exc).lower()
     for code, alternatives in ERROR_PATTERNS:
         if any(all(needle in text for needle in needles) for needles in alternatives):

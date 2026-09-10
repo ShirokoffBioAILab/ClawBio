@@ -56,7 +56,7 @@ def test_destructive_and_permission_methods_are_refused(method):
 
 def test_allowlist_is_exactly_what_this_skill_uses():
     assert s3.ALLOWED_S3_METHODS == {
-        "list_objects_v2", "upload_file", "download_file",
+        "list_objects_v2", "upload_file", "download_file", "head_object",
     }
     assert not any(m.startswith(("delete_", "create_bucket", "put_bucket"))
                    for m in s3.ALLOWED_S3_METHODS)
@@ -151,7 +151,7 @@ def test_a_multipart_etag_is_flagged_as_not_a_checksum():
     single = s3.describe_etag("deadbeef")
     multi = s3.describe_etag("deadbeef-12")
 
-    assert single["is_md5"] is True
+    assert single["is_md5"] is False  # Encryption/upload evidence is unavailable.
     assert multi["is_md5"] is False
     assert multi["parts"] == 12
     assert "not" in multi["note"].lower()
@@ -199,9 +199,11 @@ def test_download_writes_under_the_destination_preserving_relative_layout(tmp_pa
     result = s3.download_objects(client=client, bucket="bucket", objects=objects,
                                  key_prefix="out/7/", destination=tmp_path)
 
-    assert sorted(p.relative_to(tmp_path).as_posix() for p in written) == [
+    assert sorted(Path(p["path"]).relative_to(tmp_path).as_posix() for p in result["downloaded_files"]) == [
         "a.txt", "logs/b.txt",
     ]
+    assert all(not p.exists() for p in written), "temporary download files must be cleaned"
+    assert (tmp_path / "a.txt").read_text() == "data"
     assert result["n_downloaded"] == 2
 
 

@@ -1,0 +1,31 @@
+{
+  "data_classification": "public",
+  "dataset": "NIST Genome in a Bottle HG002 v4.2.1",
+  "reference_build": "GRCh38",
+  "reference_evidence": "Versioned publisher release path; VCF has no ##reference header",
+  "registry": "https://registry.opendata.aws/giab/",
+  "source_prefix": "s3://giab/release/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh38/",
+  "region": "us-east-1",
+  "files": [
+    {
+      "name": "HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz",
+      "bytes": 156252944,
+      "sha256": "adb4d4a50048aa13353a06b84fcfcbca09a5d17525efaa4cea44f8822e81175c"
+    },
+    {
+      "name": "HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz.tbi",
+      "bytes": 1657747,
+      "sha256": "23162712553413b10f88916c28bd1238deb703a7237be2910440773beea71894"
+    }
+  ],
+  "checksum_evidence": "SHA-256 computed locally after HTTPS download on 2026-09-06; not a publisher-signed checksum or ETag interpretation",
+  "expected": {
+    "schema_version": 1,
+    "interval": "chr22:20000000-20100000",
+    "samples": ["HG002"],
+    "reference_headers": [],
+    "records": 193,
+    "total_records": 4048342,
+    "records_sha256": "01757eea00ea4d358da4866da07226dc85e3b7b6523c7d0a4428c33dd3a258ec"
+  }
+}

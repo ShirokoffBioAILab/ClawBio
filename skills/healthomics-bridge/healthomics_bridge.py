@@ -19,10 +19,9 @@ Two things the raw SDK does not do for you, which this skill does:
   content means an accidentally repeated command is a no-op rather than a
   second charge.
 
-What it deliberately does NOT do: run-performance analysis, costed timelines,
-workflow linting, container reachability. Those are not API calls — they are
-AWS's own tooling (``amazon-omics-tools``, the Run Analyzer) — and this skill
-reports what a run did rather than judging how well it did it.
+Read-only live readiness inspects workflow containers and run-specific S3 paths.
+Infrastructure provisioning, policy writes and performance analysis remain
+outside the run lifecycle.
 
 Offline demo (no AWS account, no credentials, no network, no boto3 needed):
 
@@ -38,6 +37,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -58,8 +58,13 @@ import error_codes as _error_codes  # noqa: E402
 import params_template as _params_template  # noqa: E402
 import preflight as _preflight  # noqa: E402
 import recommendations as _recommendations  # noqa: E402
+import readiness as _readiness  # noqa: E402
+import ecr_client as _ecr  # noqa: E402
 import registration as _registration  # noqa: E402
 import s3_client as _s3  # noqa: E402
+import submission as _submission  # noqa: E402
+import output_manifest as _outputs  # noqa: E402
+import observability as _observability  # noqa: E402
 from omics_client import (  # noqa: E402
     ALLOWED_OPERATIONS,
     PERMANENTLY_EXCLUDED,
@@ -69,8 +74,9 @@ from omics_client import (  # noqa: E402
     build_boto_client,
 )
 
-SKILL_NAME = "healthomics-bridge"
-SKILL_VERSION = "0.1.0"
+from contracts import SKILL_NAME, SKILL_VERSION
+from reporting import _report_markdown, _LIST_MODES
+from monitoring import fetch_run_bundle, wait_for_run, _enrich_failed_tasks
 
 _SKILL_DIR = Path(__file__).resolve().parent
 _REL_SCRIPT = Path("skills") / _SKILL_DIR.name / Path(__file__).name
@@ -190,6 +196,27 @@ def derive_request_id(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+def prepare_start_request(args: argparse.Namespace) -> dict[str, Any]:
+    params = json.loads(Path(args.params).read_text(encoding="utf-8"))
+    if not isinstance(params, dict):
+        raise ValueError("Params JSON must be an object.")
+    check_remote_inputs(params, args.output_uri, args.allow_remote_inputs)
+    request = build_start_run_request(
+        workflow_id=args.start_run, workflow_type=args.workflow_type,
+        params=params, output_uri=args.output_uri, role_arn=args.role_arn,
+        run_name=args.run_name, request_id="", storage_type=args.storage_type,
+        storage_capacity=(normalise_storage_capacity(args.storage_capacity, announce=True)
+                          if args.storage_capacity else None),
+        cache_id=args.cache_id, cache_behavior=args.cache_behavior,
+        run_group_id=args.run_group_id, workflow_version_name=args.workflow_version_name,
+        tags=json.loads(args.run_tags) if args.run_tags else None,
+    )
+    canonical = {k: v for k, v in request.items() if k != "requestId"}
+    request["requestId"] = hashlib.sha256(json.dumps(canonical, sort_keys=True,
+                                                     separators=(",", ":")).encode()).hexdigest()[:32]
+    return request
+
+
 def build_start_run_request(
     *,
     workflow_id: str,
@@ -266,37 +293,6 @@ def list_all(
     return items[:limit]
 
 
-_TERMINAL_RUN_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "DELETED"})
-
-
-def wait_for_run(
-    *, client: OmicsClient, run_id: str, poll_seconds: float = 30.0,
-    timeout_seconds: float = 86_400.0,
-) -> dict[str, Any]:
-    """Poll ``GetRun`` until the run reaches a terminal state.
-
-    Watching a run you started is not analysis, so it belongs here rather than
-    a separate tool. Uses only ``GetRun``, already allow-listed, so this adds
-    no reach — a caller who can start a run can already read its status.
-
-    Raises ``TimeoutError`` rather than polling forever: an unbounded loop
-    against a billing API is how a stuck run becomes a stuck terminal.
-    """
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        run = client.call("GetRun", id=str(run_id))
-        status = str(run.get("status", "")).upper()
-        if status in _TERMINAL_RUN_STATES:
-            return run
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Run {run_id} was {status or 'UNKNOWN'} after {timeout_seconds:.0f}s. "
-                f"It is still running and still billing — this gave up watching, "
-                f"it did not stop the run."
-            )
-        time.sleep(poll_seconds)
-
-
 def normalise_storage_capacity(requested: int, *, announce: bool = False) -> int:
     """Round a STATIC capacity up to what AWS will actually allocate and bill.
 
@@ -319,28 +315,6 @@ def normalise_storage_capacity(requested: int, *, announce: bool = False) -> int
             file=sys.stderr,
         )
     return allocated
-
-
-def _enrich_failed_tasks(*, client: OmicsClient, run_id: str, tasks: list[dict[str, Any]]) -> None:
-    """Fetch the one field ListRunTasks omits: why a failed task failed.
-
-    Mutates ``tasks`` in place. Scoped to FAILED/CANCELLED tasks, capped at
-    ``_MAX_TASKS_TO_ENRICH``, and best-effort per task -- a permissions gap or
-    a single GetRunTask failure must not sink an otherwise good report, the
-    same posture as the tag lookup above it.
-    """
-    failed = [t for t in tasks if str(t.get("status", "")).upper() in {"FAILED", "CANCELLED"}]
-    for task in failed[:_MAX_TASKS_TO_ENRICH]:
-        task_id = task.get("taskId")
-        if not task_id:
-            continue
-        try:
-            detail = client.call("GetRunTask", id=str(run_id), taskId=str(task_id))
-        except Exception:
-            continue
-        for field in ("statusMessage", "failureReason", "logStream"):
-            if detail.get(field):
-                task[field] = detail[field]
 
 
 def run_output_prefix(output_uri: str, run_id: str) -> str:
@@ -397,7 +371,7 @@ def upload_run_inputs(
 
 def download_run_outputs(
     *, client: Any, output_uri: str, run_id: str, destination: Path,
-    confirmed: bool,
+    confirmed: bool, run_output_uri: str | None = None,
 ) -> dict[str, Any]:
     """Bring one run's outputs back to this machine.
 
@@ -406,7 +380,7 @@ def download_run_outputs(
     reflexive, and a flag passed on every command stops carrying meaning on the
     command where it matters.
     """
-    prefix_uri = run_output_prefix(output_uri, run_id)
+    prefix_uri = run_output_uri.rstrip("/") + "/" if run_output_uri else run_output_prefix(output_uri, run_id)
     objects = _s3.list_objects(client=client, uri=prefix_uri)
     bucket, key_prefix = _s3.parse_s3_uri(prefix_uri)
 
@@ -434,7 +408,7 @@ def download_run_outputs(
 
 def verify_run_outputs(
     *, client: Any, output_uri: str, run_id: str, depth: str,
-    destination: Path | None, confirmed: bool,
+    destination: Path | None, confirmed: bool, run_output_uri: str | None = None,
 ) -> dict[str, Any]:
     """Say what a run actually produced, at one of two depths.
 
@@ -447,7 +421,7 @@ def verify_run_outputs(
     ``write_checksums`` silently skips paths that are missing and so cannot
     detect an output that never landed.
     """
-    prefix_uri = run_output_prefix(output_uri, run_id)
+    prefix_uri = run_output_uri.rstrip("/") + "/" if run_output_uri else run_output_prefix(output_uri, run_id)
     listed = _s3.list_objects(client=client, uri=prefix_uri)
 
     objects: list[dict[str, Any]] = []
@@ -462,6 +436,8 @@ def verify_run_outputs(
     }
     if depth != "deep":
         return result
+    if not confirmed:
+        raise EgressRefused("Deep verification requires --confirm-download")
 
     bucket, key_prefix = _s3.parse_s3_uri(prefix_uri)
     target = Path(destination) if destination else Path.cwd() / f"run-{run_id}"
@@ -684,56 +660,6 @@ def untag_run(*, client: OmicsClient, run_id: str, keys: list[str]) -> dict[str,
     return {"mode": "untag", "run_id": run_id, "untagged": keys, "arn": arn}
 
 
-def fetch_run_bundle(*, client: OmicsClient, run_id: str) -> dict[str, Any]:
-    """Everything one run report needs, in as few calls as possible.
-
-    Still one workflow lookup, with no try-PRIVATE-then-retry-READY2RUN dance —
-    but not because the id self-resolves. ``GetWorkflow`` raises
-    ``ResourceNotFoundException`` for a Ready2Run id unless told
-    ``type=READY2RUN``; the run record carries ``workflowType``, so the type is
-    already known before the call, and no try-one-then-the-other retry is
-    needed.
-    """
-    run = client.call("GetRun", id=str(run_id))
-    tasks_response = client.call("ListRunTasks", id=str(run_id))
-    tasks = list(tasks_response.get("items", []))
-    _enrich_failed_tasks(client=client, run_id=run_id, tasks=tasks)
-
-    workflow: dict[str, Any] = {}
-    workflow_id = run.get("workflowId")
-    if workflow_id:
-        lookup: dict[str, Any] = {"id": str(workflow_id)}
-        # Omitted rather than guessed when the run does not say: AWS's own
-        # default is the right answer, and a wrong guess is a not-found error
-        # that reads like a bad id.
-        workflow_type = run.get("workflowType")
-        if workflow_type:
-            lookup["type"] = workflow_type
-        try:
-            workflow = client.call("GetWorkflow", **lookup)
-        except Exception:
-            # A workflow this account can no longer see does not invalidate the
-            # run report; it just means the workflow block stays empty. This
-            # once also hid a real bug — the lookup failing for every Ready2Run
-            # run — so the report names the workflow as unavailable rather than
-            # quietly omitting it.
-            workflow = {}
-
-    # Tags are read back, not echoed from the submission. Setting run tags is
-    # this skill's headline capability and it could not confirm its own work --
-    # verifying required the AWS CLI. Read-only and best-effort: a missing
-    # ListTagsForResource permission must not sink an otherwise good report.
-    tags: dict[str, str] = {}
-    arn = run.get("arn")
-    if arn:
-        try:
-            tags = dict(client.call("ListTagsForResource", resourceArn=str(arn)).get("tags", {}))
-        except Exception:
-            tags = {}
-
-    return {"run": run, "workflow": workflow, "tasks": tasks, "tags": tags}
-
-
 def submit_run(
     *, client: OmicsClient, request: dict[str, Any], confirmed: bool
 ) -> dict[str, Any]:
@@ -853,579 +779,6 @@ def map_params_template_report(payload: dict[str, Any], *, region: str) -> dict[
     )
 
 
-def _transfer_markdown(data: dict[str, Any]) -> str:
-    """Report for the modes that move bytes or create a workflow."""
-    mode = data["mode"]
-    titles = {
-        "upload": "AWS HealthOmics — Input Upload",
-        "download": "AWS HealthOmics — Output Download",
-        "register": "AWS HealthOmics — Workflow Registration",
-    }
-    acted = {"upload": data.get("uploaded"), "download": data.get("downloaded"),
-             "register": data.get("registered")}[mode]
-    header = generate_report_header(
-        title=titles[mode],
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={
-            "Mode": f"{mode.title()}" + ("" if acted else " — DRY RUN"),
-            "Region": data["region"],
-        },
-    )
-    lines = [header, ""]
-
-    if mode == "upload":
-        lines += ["## Upload", ""]
-        lines.append(f"**Destination**: `{data['destination']}`")
-        if acted:
-            lines.append(
-                f"\n{data['n_uploaded']} file(s), {data['n_bytes']:,} bytes uploaded."
-            )
-            lines += ["", "| Source | S3 URI | Bytes |", "|---|---|---|"]
-            for entry in data.get("uploaded_files", []):
-                lines.append(
-                    f"| `{entry['source']}` | `{entry['uri']}` | {entry['n_bytes']:,} |"
-                )
-            lines.append(
-                "\nPass these URIs to `--start-run --params`; this skill does not "
-                "write them into a params file for you."
-            )
-        else:
-            lines.append("\n**Nothing was uploaded.** Files that would be sent:")
-            lines += [""] + [f"- `{p}`" for p in data.get("sources", [])]
-            lines.append("\nRe-run with `--confirm-upload` to transfer.")
-
-    elif mode == "download":
-        lines += ["## Download", ""]
-        lines.append(f"**Source**: `{data['source']}`")
-        if acted:
-            lines.append(
-                f"\n{data['n_downloaded']} of {data['n_objects']} object(s) written "
-                f"to `{data['destination']}`."
-            )
-            if data.get("failures"):
-                lines += ["", "### Failed", ""]
-                for failure in data["failures"]:
-                    lines.append(f"- `{failure['key']}` — {failure['error']}")
-        else:
-            lines.append(
-                f"\n**Nothing was downloaded.** {data['n_objects']} object(s), "
-                f"{data['n_bytes']:,} bytes are available. Re-run with "
-                f"`--confirm-download` to transfer — S3 egress is billable."
-            )
-
-    else:  # register
-        zip_manifest = data.get("zip") or {}
-        lines += ["## Workflow definition", ""]
-        lines.append(f"- **Name**: `{data['workflow_name']}`")
-        lines.append(f"- **Engine**: {data['engine']}")
-        lines.append(f"- **Definition**: `{data['definition_path']}`")
-        lines.append(
-            f"- **Archive**: {zip_manifest.get('n_bytes', 0):,} bytes, "
-            f"`{str(zip_manifest.get('sha256', ''))[:16]}…` "
-            f"({zip_manifest.get('compression', 'stored')})"
-        )
-        lines += ["", "| Archive member | Bytes | sha256 |", "|---|---|---|"]
-        for member in zip_manifest.get("members", []):
-            lines.append(
-                f"| `{member['archive_name']}` | {member['n_bytes']:,} | "
-                f"`{member['sha256'][:12]}…` |"
-            )
-        lines.append(
-            "\nThe archive digest is reproducible: the same inputs always produce "
-            "the same bytes, so it pins exactly what was uploaded."
-        )
-        if acted:
-            status = data.get("workflow_status")
-            lines += ["", f"## Workflow created — status `{status}`", ""]
-            lines.append(f"- **Workflow id**: `{data['workflow_id']}`")
-            if status == "FAILED":
-                reason = data.get("workflow_status_message")
-                lines.append("\n**This workflow failed to register and cannot be run.**")
-                if reason:
-                    lines.append(f"\nAWS's own reason: {reason}")
-                else:
-                    lines.append(
-                        "\nAWS validates the definition server-side — there is no "
-                        "lint API to catch this earlier — so check that the "
-                        "entrypoint filename matches what the engine expects."
-                    )
-            else:
-                lines.append(
-                    f"\nRun it with:\n\n```bash\n--start-run {data['workflow_id']} "
-                    f"--workflow-type PRIVATE --params params.json \\\n"
-                    f"  --output-uri s3://<bucket>/output/ --role-arn <role> \\\n"
-                    f"  --run-name <name> --allow-remote-inputs --confirm-submit\n```"
-                )
-            lines.append(
-                f"\nThis skill cannot delete a workflow — that is barred by "
-                f"consequence, not by omission. Remove it with:\n\n```bash\n"
-                f"aws omics delete-workflow --id {data['workflow_id']} "
-                f"--region {data['region']}\n```"
-            )
-        else:
-            lines += ["", "## Nothing was created.", ""]
-            lines.append(
-                "Re-run with `--confirm-register` to create this workflow. "
-                "Registration bills nothing; running the workflow does."
-            )
-
-    lines += ["", "## Provenance", ""] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _tag_markdown(data: dict[str, Any]) -> str:
-    """Report for tag read/write modes."""
-    labels = {
-        "tag": "Tagged",
-        "untag": "Untagged",
-        "tags": "Tags",
-        "sync-tags": "Synced Tags",
-    }
-    verb = labels[data["mode"]]
-    header = generate_report_header(
-        title=f"AWS HealthOmics — Run {verb}",
-        skill_name=SKILL_NAME, skill_version=SKILL_VERSION,
-        extra_metadata={"Mode": verb, "Region": data["region"]},
-    )
-    lines = [header, "", f"## {verb}", ""]
-    lines.append(f"**Run**: `{data['run_id']}` (`{data['arn']}`)")
-    if data["mode"] == "tag":
-        rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["tagged"].items()))
-        lines.append(f"\nSet: {rendered}")
-    elif data["mode"] == "untag":
-        lines.append(f"\nRemoved: {', '.join(f'`{k}`' for k in data['untagged'])}")
-    elif data["mode"] == "sync-tags":
-        if data.get("set"):
-            rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["set"].items()))
-            lines.append(f"\nSet/updated: {rendered}")
-        if data.get("removed"):
-            lines.append(f"\nRemoved: {', '.join(f'`{k}`' for k in data['removed'])}")
-        if not data.get("set") and not data.get("removed"):
-            lines.append("\nNo changes were needed.")
-    tags = data.get("tags") or data.get("desired_tags") or data.get("tagged") or {}
-    if tags:
-        lines += ["", "| Key | Value |", "|---|---|"]
-        for key, value in sorted(tags.items()):
-            lines.append(f"| `{key}` | `{value}` |")
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _register_version_markdown(data: dict[str, Any]) -> str:
-    """Report for adding a version to an existing workflow."""
-    acted = data.get("registered")
-    header = generate_report_header(
-        title="AWS HealthOmics — Workflow Version",
-        skill_name=SKILL_NAME, skill_version=SKILL_VERSION,
-        extra_metadata={
-            "Mode": "Register version" + ("" if acted else " — DRY RUN"),
-            "Region": data["region"],
-        },
-    )
-    zip_manifest = data.get("zip") or {}
-    lines = [header, "", "## Version definition", ""]
-    lines.append(f"- **Workflow id**: `{data['workflow_id']}`")
-    lines.append(f"- **Version name**: `{data['version_name']}`")
-    lines.append(f"- **Engine**: {data['engine']}")
-    lines.append(
-        f"- **Archive**: {zip_manifest.get('n_bytes', 0):,} bytes, "
-        f"`{str(zip_manifest.get('sha256', ''))[:16]}…`"
-    )
-    if acted:
-        status = data.get("version_status")
-        lines += ["", f"## Version created — status `{status}`", ""]
-        if status == "FAILED":
-            reason = data.get("version_status_message")
-            lines.append("\n**This version failed to register.**")
-            if reason:
-                lines.append(f"\nAWS's own reason: {reason}")
-        else:
-            lines.append(
-                f"\nRun it with `--start-run {data['workflow_id']} "
-                f"--workflow-version-name {data['version_name']} ...`"
-            )
-    else:
-        lines += ["", "## Nothing was created.", ""]
-        lines.append("Re-run with `--confirm-register` to create this version.")
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _check_markdown(data: dict[str, Any]) -> str:
-    """Report for --check."""
-    header = generate_report_header(
-        title="AWS HealthOmics — Preflight",
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={"Mode": "Preflight", "Region": data["region"]},
-    )
-    lines = [header, "", "## Checks", ""]
-    lines.append(
-        f"{data.get('n_checks', 0)} check(s): "
-        f"{data.get('n_failed', 0)} failed, {data.get('n_warnings', 0)} warning(s)."
-    )
-    lines += ["", "| Check | Result | Severity | Detail |", "|---|---|---|---|"]
-    for check in data.get("checks", []):
-        result = "PASS" if check.get("ok") else "FAIL"
-        lines.append(
-            f"| `{check.get('name', '')}` | {result} | "
-            f"{check.get('severity', '')} | {check.get('detail', '')} |"
-        )
-    lines += ["", "## Provenance", ""] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _workflow_search_markdown(data: dict[str, Any]) -> str:
-    """Report for workflow search and recommendation."""
-    title = (
-        "AWS HealthOmics — Workflow Recommendations"
-        if data["mode"] == "workflow-recommendations"
-        else "AWS HealthOmics — Workflow Search"
-    )
-    header = generate_report_header(
-        title=title,
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={"Mode": data["mode"], "Region": data["region"]},
-    )
-    lines = [header, "", f"## Query", "", f"`{data.get('query', '')}`", ""]
-    lines.append(f"{data.get('n_items', 0)} workflow(s) matched.")
-    lines += ["", "| Score | Id | Name | Status | Type |", "|---|---|---|---|---|"]
-    for item in data.get("items", []):
-        lines.append(
-            f"| {item.get('matchScore', '')} | `{item.get('id', 'n/a')}` | "
-            f"{item.get('name', 'n/a')} | {item.get('status', 'n/a')} | "
-            f"{item.get('type', item.get('workflowType', 'n/a'))} |"
-        )
-    if data.get("items"):
-        first = data["items"][0]
-        lines += [
-            "",
-            "## Next step",
-            "",
-            "Generate a params skeleton before submitting:",
-            "",
-            "```bash",
-            f"--params-template {first.get('id', '<workflow-id>')} "
-            f"--workflow-type {first.get('type', first.get('workflowType', 'PRIVATE'))}",
-            "```",
-        ]
-    lines += ["", "## Provenance", ""] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _params_template_markdown(data: dict[str, Any]) -> str:
-    """Report for --params-template."""
-    header = generate_report_header(
-        title="AWS HealthOmics — Params Template",
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={"Mode": "Params template", "Region": data["region"]},
-    )
-    lines = [header, "", "## Workflow", ""]
-    lines += [
-        f"- **Workflow id**: `{data.get('workflow_id', 'n/a')}`",
-        f"- **Workflow name**: {data.get('workflow_name', 'n/a')}",
-        f"- **Workflow type**: {data.get('workflow_type', 'n/a')}",
-    ]
-    lines += ["", "## Parameters", ""]
-    if data.get("items"):
-        lines += ["| Name | Default |", "|---|---|"]
-        for item in data["items"]:
-            lines.append(f"| `{item['name']}` | `{item['default']}` |")
-    else:
-        lines.append("No parameter template was exposed for this workflow.")
-    lines += [
-        "",
-        "A writable skeleton is in `params.template.json`; use it as the starting params file and fill in real S3/local values before `--start-run`.",
-        "",
-        "## Provenance",
-        "",
-    ] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-def _verification_lines(data: dict[str, Any]) -> list[str]:
-    """Render what the run actually produced, without overstating it.
-
-    The ETag distinction is the whole point of this section. For a single-part
-    upload an ETag is the object's MD5; for a multipart upload it is the MD5 of
-    the concatenated part MD5s and hashes nothing recomputable from the file.
-    Genomic outputs are routinely multipart, so calling either one "the
-    checksum" would put a guarantee in the bundle that does not hold.
-    """
-    verification = data.get("verification")
-    if not verification:
-        return []
-
-    deep = verification.get("depth") == "deep"
-    lines = ["", "## Outputs", ""]
-    lines.append(
-        f"{verification['n_objects']} object(s), "
-        f"{verification['n_bytes']:,} bytes under `{verification['source']}`."
-    )
-
-    if deep:
-        if verification.get("complete"):
-            downloaded_to = verification.get("downloaded_to", "the requested destination")
-            lines.append(
-                f"\nEvery listed object was downloaded to "
-                f"`{downloaded_to}` and hashed. The SHA-256 values "
-                f"below are real checksums of the bytes on disk."
-            )
-        else:
-            lines.append(
-                f"\n**{verification['n_missing']} listed object(s) could not be "
-                f"retrieved**, so this verification is incomplete: "
-                + ", ".join(f"`{k}`" for k in verification.get("missing", [])[:5])
-            )
-    else:
-        lines.append(
-            "\nListing only — no bytes were transferred. **The ETag column is "
-            "not a checksum**: it equals the object's MD5 only for a single-part "
-            "upload, and for a multipart upload it is the MD5 of the part MD5s "
-            "with a `-N` suffix, which cannot be recomputed from the file. Use "
-            "`--verify-outputs deep` for real SHA-256 checksums."
-        )
-
-    header = "| Key | Bytes | ETag | MD5? |" + (" SHA-256 |" if deep else "")
-    divider = "|---|---|---|---|" + ("---|" if deep else "")
-    lines += ["", header, divider]
-    for entry in verification["objects"][:50]:
-        row = (
-            f"| `{entry['key']}` | {entry['size']:,} | `{entry['etag']}` | "
-            f"{'yes' if entry.get('is_md5') else 'no (multipart)'} |"
-        )
-        if deep:
-            digest = entry.get("sha256")
-            row += f" `{digest[:16]}…`|" if digest else " **missing** |"
-        lines.append(row)
-    if len(verification["objects"]) > 50:
-        lines.append(f"\n…and {len(verification['objects']) - 50} more.")
-
-    return lines
-
-
-def _provenance_lines(data: dict[str, Any]) -> list[str]:
-    """The honest ceiling for work that happened in someone else's account."""
-    if data["demo"]:
-        ceiling = (
-            "This report replays a synthetic fixture. No AWS call was made, and "
-            "nothing here describes an actual account, run or workflow."
-        )
-    elif data.get("mode") != "run" or not data["run"].get("id"):
-        ceiling = (
-            "No AWS HealthOmics run executed as part of this report. Any "
-            "identifiers above describe an unsent request or a query result, "
-            "not a run that took place."
-        )
-    else:
-        verification = data.get("verification") or {}
-        if verification.get("depth") == "deep" and verification.get("complete"):
-            outputs = (
-                f"Every one of the {verification['n_objects']} output object(s) was "
-                f"downloaded and hashed; the sha256 values in tables/outputs.csv are "
-                f"real checksums of those bytes, computed here rather than reported "
-                f"by AWS."
-            )
-        elif verification.get("depth") == "deep":
-            outputs = (
-                f"Output verification is INCOMPLETE: {verification['n_missing']} of "
-                f"{verification['n_objects']} listed object(s) could not be "
-                f"retrieved, so the checksums below cover only part of the run."
-            )
-        elif verification.get("depth") == "manifest":
-            outputs = (
-                f"The {verification['n_objects']} output object(s) were listed but "
-                f"not fetched, so no checksum in this bundle covers their bytes — an "
-                f"ETag is not one. Use `--verify-outputs deep` for real sha256s."
-            )
-        else:
-            outputs = (
-                "No checksum in this bundle covers the run's outputs, which remain "
-                "in S3 and were not read. Add `--verify-outputs` to record what the "
-                "run produced."
-            )
-        ceiling = (
-            "This run executed in AWS HealthOmics. Replaying it requires the same "
-            "account, execution role and container images. The identifiers here "
-            f"pin what the run WAS. {outputs}"
-        )
-    return [
-        "- Transport: **boto3** (AWS HealthOmics API directly).",
-        f"- Allow-listed operations: {len(ALLOWED_OPERATIONS)} of 107 available.",
-        "",
-        ceiling,
-    ]
-
-
-_LIST_MODES = {
-    "runs",
-    "workflows",
-    "run-groups",
-    "run-caches",
-    "workflow-versions",
-    "workflow-search",
-    "workflow-recommendations",
-}
-
-
-def _report_markdown(data: dict[str, Any]) -> str:
-    if data.get("mode") == "check":
-        return _check_markdown(data)
-    if data.get("mode") in {"workflow-search", "workflow-recommendations"}:
-        return _workflow_search_markdown(data)
-    if data.get("mode") == "params-template":
-        return _params_template_markdown(data)
-    if data.get("mode") in _LIST_MODES:
-        return _list_markdown(data)
-    if data.get("mode") in {"upload", "download", "register"}:
-        return _transfer_markdown(data)
-    if data.get("mode") in {"tag", "untag", "tags", "sync-tags"}:
-        return _tag_markdown(data)
-    if data.get("mode") == "register-version":
-        return _register_version_markdown(data)
-
-    run = data["run"]
-    workflow = data["workflow"]
-    header = generate_report_header(
-        title="AWS HealthOmics Run Report",
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={
-            "Mode": "Synthetic offline demo" if data["demo"] else "Live AWS HealthOmics (boto3)",
-            "Region": data["region"],
-            "Run status": str(data["run_status"]),
-        },
-    )
-    lines = [header, "", "## Run", ""]
-    lines += [
-        f"- **Run id**: `{run.get('id', 'n/a')}`",
-        f"- **Run name**: {run.get('name', 'n/a')}",
-        f"- **Status**: **{data['run_status']}**",
-        f"- **Workflow**: `{workflow.get('name', 'n/a')}` "
-        f"(`{workflow.get('id', run.get('workflowId', 'n/a'))}`, "
-        f"{workflow.get('type', run.get('workflowType', 'n/a'))})",
-        f"- **Output URI**: `{run.get('outputUri', 'n/a')}`",
-    ]
-    if data.get("tags"):
-        rendered = ", ".join(f"`{k}={v}`" for k, v in sorted(data["tags"].items()))
-        lines.append(f"- **Tags**: {rendered}")
-    # Read back rather than echoed: this is what AWS holds, which is the only
-    # way to confirm the tags this skill set actually landed.
-    if run.get("statusMessage"):
-        lines.append(f"- **Status message**: {run['statusMessage']}")
-
-    lines += ["", "## Tasks", ""]
-    lines.append(
-        f"{data['n_tasks']} task(s): {data['n_completed']} completed, {data['n_failed']} failed."
-    )
-    if data["n_failed"]:
-        lines += ["", "### Failed tasks", ""]
-        for task in data["tasks"]:
-            if str(task.get("status", "")).upper() not in {"FAILED", "CANCELLED"}:
-                continue
-            lines.append(
-                f"- **{task.get('name', task.get('taskId', 'unknown'))}** "
-                f"(`{task.get('taskId', 'n/a')}`) — {task.get('status')}"
-            )
-            # The reason is the whole point of reading this section. AWS puts
-            # it on the task, and omitting it sent users to the console for the
-            # one fact they came for.
-            reason = task.get("statusMessage") or task.get("failureReason")
-            if reason:
-                lines.append(f"  - {reason}")
-            # Fetched by _enrich_failed_tasks and previously discarded: the log
-            # location is the next thing a user reading this section needs.
-            log_stream = task.get("logStream")
-            if log_stream:
-                group, _, stream = log_stream.partition(":log-stream:")
-                group_name = group.split(":log-group:")[-1] if ":log-group:" in group else group
-                lines.append(f"  - Logs: `{log_stream}`")
-                lines.append(
-                    f"    ```bash\n    aws logs get-log-events "
-                    f"--log-group-name {group_name} --log-stream-name {stream}\n    ```"
-                )
-
-    if data.get("start_run_request") is not None:
-        lines += ["", "## Submission", ""]
-        verb = "Submitted" if data["submitted"] else "NOT submitted (estimate only)"
-        lines.append(f"**{verb}.** The exact request:")
-        lines += ["", "```json", json.dumps(data["start_run_request"], indent=2), "```"]
-        cost = estimated_cost_line(str(data["start_run_request"].get("workflowId", "")))
-        if cost and data["start_run_request"].get("workflowType") == "READY2RUN":
-            lines += ["", f"**Estimated cost**: {cost}"]
-        if not data["submitted"]:
-            lines.append(
-                "\nNo run was started and nothing was billed. Re-run with "
-                "`--confirm-submit` to submit this request."
-            )
-
-    output_uri = run.get("outputUri")
-    if output_uri:
-        # HealthOmics writes each run under <outputUri>/<runId>/. Pointing the
-        # command at <outputUri> alone pulls every run this account ever wrote
-        # into one directory -- and this is the line users copy verbatim.
-        run_id = str(run.get("id", "")).strip()
-        prefix = f"{output_uri.rstrip('/')}/{run_id}/" if run_id else output_uri
-        lines += [
-            "", "## Fetching the outputs", "",
-            "Outputs stay in S3. Bring this run's outputs down with:",
-            "", "```bash",
-            f"--download-outputs {run_id or '<run-id>'} --to ./run-{run_id or 'outputs'}/ "
-            f"--confirm-download",
-            "```",
-            "", "or with the AWS CLI directly:", "", "```bash",
-            f"aws s3 cp --recursive {prefix} ./run-{run_id or 'outputs'}/",
-            "```",
-        ]
-
-    lines += _verification_lines(data)
-    lines += ["", "## Provenance", ""] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
-_LIST_TITLES = {
-    "runs": "AWS HealthOmics Runs",
-    "workflows": "AWS HealthOmics Workflows",
-    "run-groups": "AWS HealthOmics Run Groups",
-    "run-caches": "AWS HealthOmics Run Caches",
-    "workflow-versions": "AWS HealthOmics Workflow Versions",
-    "workflow-search": "AWS HealthOmics Workflow Search",
-    "workflow-recommendations": "AWS HealthOmics Workflow Recommendations",
-}
-
-
-def _list_markdown(data: dict[str, Any]) -> str:
-    title = _LIST_TITLES[data["mode"]]
-    header = generate_report_header(
-        title=title,
-        skill_name=SKILL_NAME,
-        skill_version=SKILL_VERSION,
-        extra_metadata={
-            "Mode": "Synthetic offline demo" if data["demo"] else "Live AWS HealthOmics (boto3)",
-            "Region": data["region"],
-        },
-    )
-    lines = [header, "", f"## {title}", "", f"{data['n_items']} item(s).", ""]
-    lines += ["| Id | Name | Status | Type |", "|---|---|---|---|"]
-    for item in data["items"]:
-        lines.append(
-            f"| `{item.get('id', 'n/a')}` | {item.get('name', 'n/a')} | "
-            f"{item.get('status', 'n/a')} | "
-            f"{item.get('type', item.get('workflowType', 'n/a'))} |"
-        )
-    lines += ["", "## Provenance", ""] + _provenance_lines(data)
-    lines += ["", generate_report_footer().strip(), ""]
-    return "\n".join(lines)
-
-
 # Per-entity table columns. A listing and a run report describe different
 # things, so they get different tables rather than one shape pretending to fit
 # both -- see _write_table.
@@ -1435,7 +788,7 @@ _WORKFLOW_SEARCH_FIELDS = ("id", "name", "status", "type", "matchScore", "creati
 _RUN_GROUP_FIELDS = ("id", "name", "maxCpus", "maxRuns", "maxDuration")
 _RUN_CACHE_FIELDS = ("id", "name", "status", "cacheS3Uri")
 _WORKFLOW_VERSION_FIELDS = ("workflowId", "versionName", "status", "creationTime")
-_CHECK_FIELDS = ("name", "ok", "severity", "detail")
+_CHECK_FIELDS = ("name", "status", "ok", "severity", "detail", "code")
 _PARAMETER_FIELDS = ("name", "default", "template")
 _TAG_FIELDS = ("key", "value")
 
@@ -1555,6 +908,8 @@ def _replay_args(mode: str | None, data: dict[str, Any]) -> list[Any]:
     this fails loudly (KeyError) rather than silently inheriting the wrong
     replay.
     """
+    if data.get("invocation"):
+        return list(data["invocation"])
     if mode in _LIST_MODES:
         flags = {
             "runs": ["--list-runs"],
@@ -1647,12 +1002,32 @@ def _write_extra_artifacts(output_dir: Path, data: dict[str, Any]) -> list[Path]
     repro_dir = output_dir / "reproducibility"
     repro_dir.mkdir(parents=True, exist_ok=True)
 
+    readiness = data.get("readiness") or (data if data.get("mode") == "check" else {})
+    if readiness.get("environment"):
+        path = output_dir / "environment.json"
+        write_text_lf(path, json.dumps(readiness["environment"], indent=2, default=str) + "\n")
+        written.append(path)
+    for name in ("logs", "analysis", "smoke_validation"):
+        if data.get(name) is not None:
+            path = output_dir / f"{name}.json"
+            _atomic_json(path, data[name])
+            written.append(path)
+    for filename in ("submission.json", "readiness.json"):
+        path = output_dir / filename
+        if path.exists():
+            written.append(path)
+
     manifest = {
         "mode": data.get("mode") or "run",
         "region": data.get("region"),
         "run_id": data.get("run", {}).get("id") or data.get("run_id"),
         "workflow_id": data.get("workflow_id") or data.get("run", {}).get("workflowId"),
-        "workflow_version_name": data.get("version_name") or data.get("workflow_version_name"),
+        "workflow_version_name": data.get("version_name") or data.get("workflow_version_name") or data.get("run", {}).get("workflowVersionName"),
+        "workflow_type": data.get("workflow_type") or data.get("run", {}).get("workflowType"),
+        "definition_digest": data.get("run", {}).get("digest") or data.get("workflow", {}).get("digest"),
+        "resource_digests": data.get("run", {}).get("resourceDigests", {}),
+        "run_output_uri": data.get("run", {}).get("runOutputUri"),
+        "invocation": data.get("invocation", []),
         "request_id": data.get("start_run_request", {}).get("requestId")
         if isinstance(data.get("start_run_request"), dict) else None,
         "params_sha256": hashlib.sha256(
@@ -1684,6 +1059,9 @@ def _write_extra_artifacts(output_dir: Path, data: dict[str, Any]) -> list[Path]
             "complete": not data.get("failures"),
         }
     if outputs_payload is not None:
+        outputs_payload["schema_version"] = 2
+        outputs_payload["objects"] = [_outputs.describe_output(entry, provenance=manifest)
+                                      for entry in outputs_payload.get("objects", [])]
         path = output_dir / "outputs.json"
         write_text_lf(path, json.dumps(outputs_payload, indent=2, default=str) + "\n")
         written.append(path)
@@ -1693,9 +1071,11 @@ def _write_extra_artifacts(output_dir: Path, data: dict[str, Any]) -> list[Path]
             local_path = entry.get("local_path") or entry.get("path")
             if not local_path:
                 continue
-            partners = _handoff_for_path(str(local_path))
+            partners = entry.get("suggested_skills", [])
             if partners:
-                handoff_items.append({"path": local_path, "suggested_skills": partners})
+                handoff_items.append({"path": local_path, "suggested_skills": partners,
+                                      "sample_ids": entry["sample_ids"], "reference": entry["reference"],
+                                      "qc": entry["qc"], "provenance": entry["provenance"]})
         handoff = {
             "source": outputs_payload.get("source"),
             "items": handoff_items,
@@ -1741,6 +1121,10 @@ def write_bundle(
     args: list[Any] = _replay_args(mode, data)
     if data["demo"]:
         args = ["--demo"]
+    else:
+        args += ["--region", data["region"]]
+        if data.get("profile"):
+            args += ["--profile", data["profile"]]
     args += ["--output", ReproPath(output_dir, anchor="output_dir")]
 
     commands_path = write_portable_commands_sh(
@@ -1759,7 +1143,7 @@ def write_bundle(
     env_path = write_environment_yml(
         output_dir,
         env_name="clawbio-healthomics-bridge",
-        pip_deps=["boto3>=1.34"],
+        pip_deps=["boto3>=1.34", "miniwdl>=1.12"],
         conda_deps=[],
         python_version="3.11",
     )
@@ -1777,6 +1161,8 @@ def write_bundle(
             "n_checks": data.get("n_checks", 0),
             "n_failed": data.get("n_failed", 0),
             "n_warnings": data.get("n_warnings", 0),
+            "n_unknown": data.get("n_unknown", 0),
+            "scope": data.get("scope", "local"),
             "region": data["region"],
             "demo": data["demo"],
         }
@@ -1816,6 +1202,11 @@ def write_bundle(
             "demo": data["demo"],
         }
         status = str(data["run_status"])
+        if mode == "run":
+            summary["execution_ok"] = (True if status == "COMPLETED" else
+                                       False if status in {"FAILED", "CANCELLED"} else None)
+            summary["failure_reason"] = data["run"].get("failureReason")
+            summary["report_ok"] = True
 
     result_path = write_result_json(
         output_dir=output_dir,
@@ -1823,11 +1214,12 @@ def write_bundle(
         version=SKILL_VERSION,
         summary=summary,
         data=data,
-        datasets={"AWS HealthOmics": "synthetic offline fixture" if data["demo"] else "live account"},
+        datasets={"AWS HealthOmics": "synthetic offline fixture" if data["demo"] else
+                  "local validation only" if mode == "check" and data.get("scope") == "local" else "live account"},
         status=status,
         # Exit 0 means the skill produced a truthful report, not that the run
         # succeeded. The run's outcome is in `status`.
-        ok=True,
+        ok=bool(data.get("ok")) if mode == "check" else True,
     )
     write_checksums(
         [report_path, result_path, table_path, commands_path, env_path, *extra_paths],
@@ -1844,42 +1236,90 @@ def run_demo(output_dir: Path) -> dict[str, Any]:
     return write_bundle(output_dir, data)
 
 
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=".healthomics-", delete=False) as stream:
+        temp = Path(stream.name)
+        try:
+            json.dump(payload, stream, indent=2, default=str)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+    try:
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _live_readiness(args: argparse.Namespace, client: OmicsClient) -> dict[str, Any]:
+    return _readiness.run_live_preflight(
+        args, omics=client,
+        ecr=_ecr.ECROperations(_boto=_ecr.build_ecr_client(args.region, args.profile)),
+        s3=_s3.S3Operations(_boto=_s3.build_s3_client(args.region, args.profile)),
+    )
+
+
 def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    if args.start_run and args.confirm_submit and (output_dir / "submission.json").exists():
+        raise FileExistsError("An existing submission receipt must be preserved; use --resume-from or a fresh output directory")
     _warn_before_overwrite(output_dir)
 
+    def _publish(directory, data, **kwargs):
+        data["profile"] = args.profile
+        data["invocation"] = list(getattr(args, "_invocation", []))
+        if args.params and args.params.is_file():
+            snapshot = directory / "reproducibility" / "params.snapshot.json"
+            _atomic_json(snapshot, json.loads(args.params.read_text(encoding="utf-8")))
+            invocation = data["invocation"]
+            if "--params" in invocation:
+                invocation[invocation.index("--params") + 1] = str(snapshot)
+        return write_bundle(directory, data, **kwargs)
+
+    if args.resume_from:
+        receipt = _submission.load_receipt(args.resume_from, profile=args.profile, region=args.region)
+        args._submission_receipt = receipt
+        client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
+        if not receipt.get("run_id"):
+            if not args.confirm_submit or not args.allow_remote_inputs:
+                raise ValueError("Submission outcome is uncertain; inspect runs, then use --confirm-submit and --allow-remote-inputs to retry the saved token")
+            saved = receipt["request"]
+            args.start_run = saved["workflowId"]
+            args.workflow_type = saved["workflowType"]
+            args.role_arn = saved["roleArn"]
+            args.output_uri = saved["outputUri"]
+            args.run_name = saved["name"]
+            args.workflow_version_name = saved.get("workflowVersionName")
+            args.params = output_dir / "recovery.params.json"
+            _atomic_json(args.params, saved["parameters"])
+            readiness = _live_readiness(args, client)
+            _atomic_json(output_dir / "readiness.json", readiness)
+            if not readiness["ok"]:
+                return _publish(output_dir, map_check_report(readiness, region=args.region), warn_before_overwrite=False)
+            args.start_run = None
+        _submission.save_receipt(output_dir / "submission.json", receipt)
+        args.run_status = _submission.recover_submission(client=client, receipt=receipt, confirmed=args.confirm_submit)
+        _submission.save_receipt(output_dir / "submission.json", receipt)
+        args._invocation = ["--run-status", args.run_status]
+
     if args.check:
-        params = {}
-        if args.params:
-            params, _ = _preflight.load_params_file(args.params)
+        if args.live:
+            client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
+            readiness = _live_readiness(args, client)
+        else:
+            readiness = _preflight.run_preflight(args)
         data = map_check_report(
-            _preflight.run_preflight(args, params=params),
+            readiness,
             region=args.region,
         )
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        data["profile"] = args.profile
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     start_run_request: dict[str, Any] | None = None
     if args.start_run:
-        params = json.loads(Path(args.params).read_text(encoding="utf-8"))
-        check_remote_inputs(params, args.output_uri, args.allow_remote_inputs)
-        request_id = derive_request_id(
-            workflow_id=args.start_run, workflow_type=args.workflow_type,
-            params=params, output_uri=args.output_uri,
-            role_arn=args.role_arn, run_name=args.run_name,
-        )
-        start_run_request = build_start_run_request(
-            workflow_id=args.start_run, workflow_type=args.workflow_type,
-            params=params, output_uri=args.output_uri, role_arn=args.role_arn,
-            run_name=args.run_name, request_id=request_id,
-            storage_type=args.storage_type,
-            storage_capacity=(
-                normalise_storage_capacity(args.storage_capacity, announce=True)
-                if args.storage_capacity else None
-            ),
-            cache_id=args.cache_id, cache_behavior=args.cache_behavior,
-            run_group_id=args.run_group_id,
-            workflow_version_name=args.workflow_version_name,
-            tags=json.loads(args.run_tags) if args.run_tags else None,
-        )
+        start_run_request = prepare_start_request(args)
         if not args.confirm_submit:
             print(
                 "ESTIMATE ONLY: no run was submitted and nothing was billed. "
@@ -1890,7 +1330,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
                 {"run": {}, "workflow": {}, "tasks": []}, region=args.region,
                 start_run_request=start_run_request, submitted=False,
             )
-            return write_bundle(output_dir, data, warn_before_overwrite=False)
+            return _publish(output_dir, data, warn_before_overwrite=False)
 
     # S3-only modes never construct an omics client: a transfer has nothing to
     # ask HealthOmics about.
@@ -1899,7 +1339,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
         data = upload_run_inputs(
             client=s3, sources=list(args.upload_inputs), destination=args.to,
             acknowledged=args.allow_remote_inputs, confirmed=args.confirm_upload)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
@@ -1921,7 +1361,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             kind="workflow-search",
             region=args.region,
         )
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.recommend_workflow:
         filters = {"type": args.workflow_type} if args.workflow_type else {}
@@ -1931,9 +1371,18 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             limit=max(args.limit, 100),
             **filters,
         )
+        candidates = _recommendations.search_workflows(items, args.recommend_workflow, limit=min(args.limit, 25))
+        detailed = []
+        for candidate in candidates:
+            try:
+                metadata = client.call("GetWorkflow", id=candidate["id"],
+                                       type=candidate.get("type", args.workflow_type or "PRIVATE"))
+                detailed.append({**candidate, **metadata})
+            except Exception:
+                detailed.append(candidate)
         recommendation = _recommendations.recommend_workflows(
-            items, args.recommend_workflow, limit=args.limit
-        )
+            detailed, args.recommend_workflow, limit=args.limit,
+            input_format=args.input_format, engine=args.recommend_engine, region=args.region)
         data = map_workflow_search_report(
             query=args.recommend_workflow,
             items=recommendation["recommendations"],
@@ -1941,7 +1390,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             region=args.region,
         )
         data["inferred_domains"] = recommendation["inferred_domains"]
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.params_template:
         lookup: dict[str, Any] = {"id": str(args.params_template)}
@@ -1961,7 +1410,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
         )
         if not data.get("workflow_id"):
             data["workflow_id"] = args.params_template
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.download_outputs:
         run = client.call("GetRun", id=str(args.download_outputs))
@@ -1974,8 +1423,8 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
         s3 = _s3.S3Operations(_boto=_s3.build_s3_client(args.region, args.profile))
         data = download_run_outputs(
             client=s3, output_uri=output_uri, run_id=str(args.download_outputs),
-            destination=Path(args.to), confirmed=args.confirm_download)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+            destination=Path(args.to), confirmed=args.confirm_download, run_output_uri=run.get("runOutputUri"))
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.register:
@@ -1997,62 +1446,62 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
                 engine=args.engine, description=args.description,
                 parameter_template=template, allow_duplicate=args.allow_duplicate_name,
                 confirmed=args.confirm_register, output_dir=output_dir)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.list_run_groups:
         items = list_all(client=client, operation="ListRunGroups", limit=args.limit)
         data = map_list_report(items, kind="run-groups", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.list_run_caches:
         items = list_all(client=client, operation="ListRunCaches", limit=args.limit)
         data = map_list_report(items, kind="run-caches", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.list_workflow_versions:
         items = list_all(client=client, operation="ListWorkflowVersions",
                          limit=args.limit, workflowId=args.list_workflow_versions)
         data = map_list_report(items, kind="workflow-versions", region=args.region)
         data["workflow_id"] = args.list_workflow_versions
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.describe_run_group:
         group = describe_run_group(client=client, group_id=args.describe_run_group)
         data = map_list_report([group], kind="run-groups", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.describe_run_cache:
         cache = describe_run_cache(client=client, cache_id=args.describe_run_cache)
         data = map_list_report([cache], kind="run-caches", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.tag_run:
         tags = json.loads(args.tags)
         data = tag_run(client=client, run_id=args.tag_run, tags=tags)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.untag_run:
         data = untag_run(client=client, run_id=args.untag_run, keys=list(args.tag_keys))
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.list_tags:
         data = list_run_tags(client=client, run_id=args.list_tags)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.sync_tags:
         tags = json.loads(args.tags)
         data = sync_run_tags(client=client, run_id=args.sync_tags, desired_tags=tags)
-        return write_bundle(output_dir, _pad_transfer_report(data, args.region),
+        return _publish(output_dir, _pad_transfer_report(data, args.region),
                             warn_before_overwrite=False)
 
     if args.list_runs:
         items = list_all(client=client, operation="ListRuns", limit=args.limit)
         data = map_list_report(items, kind="runs", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
     if args.list_workflows:
         filters: dict[str, Any] = {"type": args.workflow_type} if args.workflow_type else {}
@@ -2060,11 +1509,35 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             client=client, operation="ListWorkflows", limit=args.limit, **filters
         )
         data = map_list_report(items, kind="workflows", region=args.region)
-        return write_bundle(output_dir, data, warn_before_overwrite=False)
+        return _publish(output_dir, data, warn_before_overwrite=False)
 
+    readiness = None
     if args.start_run:
+        readiness = _live_readiness(args, client)
+        _atomic_json(output_dir / "readiness.json", readiness)
+        if not readiness["ok"]:
+            print("READINESS BLOCKED: no run submitted. See the checks in report.md.", file=sys.stderr)
+            data = map_check_report(readiness, region=args.region)
+            data["profile"] = args.profile
+            return _publish(output_dir, data, warn_before_overwrite=False)
+        if prepare_start_request(args) != start_run_request:
+            raise ValueError("Run parameters changed during readiness inspection; build a fresh plan.")
+        receipt = _submission.make_receipt(start_run_request, profile=args.profile, region=args.region)
+        _submission.save_receipt(output_dir / "submission.json", receipt)
+        args._submission_receipt = receipt
         result = submit_run(client=client, request=start_run_request, confirmed=True)
         run_id = str(result["response"].get("id", ""))
+        if not run_id:
+            raise RuntimeError("StartRun returned no run id; preserve submission.json before retrying.")
+        receipt.update(state="SUBMITTED", run_id=run_id)
+        _submission.save_receipt(output_dir / "submission.json", receipt)
+        initial = map_run_report({"run": {**result["response"], "id": run_id,
+                                  "workflowId": args.start_run, "workflowType": args.workflow_type}},
+                                 region=args.region, submitted=True, start_run_request=start_run_request)
+        initial["readiness"] = readiness
+        initial["profile"] = args.profile
+        _publish(output_dir, initial, warn_before_overwrite=False)
+        print(f"Submitted run {run_id}; receipt: {output_dir / 'submission.json'}", file=sys.stderr, flush=True)
     else:
         run_id = args.run_status
 
@@ -2079,6 +1552,11 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             client=client, run_id=run_id,
             poll_seconds=args.poll_interval,
             timeout_seconds=args.wait_timeout_seconds,
+            on_poll=lambda run: _atomic_json(output_dir / "run_state.json", {
+                "run_id": run_id, "status": run.get("status"),
+                "failure_reason": run.get("failureReason"), "status_message": run.get("statusMessage"),
+                "observed_at": time.time(), "profile": args.profile, "region": args.region,
+            }),
         )
 
     bundle = fetch_run_bundle(client=client, run_id=run_id)
@@ -2092,7 +1570,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
                 client=s3, output_uri=output_uri, run_id=run_id,
                 depth=args.verify_outputs,
                 destination=Path(args.to) if args.to else None,
-                confirmed=args.confirm_download)
+                confirmed=args.confirm_download, run_output_uri=bundle["run"].get("runOutputUri"))
         else:
             print(
                 f"WARNING: run {run_id} reports no outputUri; nothing to verify.",
@@ -2103,7 +1581,23 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
         bundle, region=args.region, start_run_request=start_run_request,
         submitted=bool(args.start_run), verification=verification,
     )
-    return write_bundle(output_dir, data, warn_before_overwrite=False)
+    data["readiness"] = readiness
+    data["profile"] = args.profile
+    if args.logs:
+        try:
+            data["logs"] = _observability.fetch_run_logs(
+                client=_observability.build_logs_client(args.region, args.profile),
+                run=bundle["run"], limit=args.log_limit)
+        except Exception as exc:
+            data["logs"] = {"status": "UNAVAILABLE", "reason": _ecr.exception_code(exc)}
+    if args.analyze_run:
+        data["analysis"] = _observability.run_analyzer(run_id=run_id,
+            output=output_dir / "analysis.csv", region=args.region, profile=args.profile)
+    if args.validate_smoke:
+        paths = [Path(item["local_path"]) for item in (verification or {}).get("objects", []) if item.get("local_path")]
+        data["smoke_validation"] = _outputs.validate_smoke_outputs(args.validate_smoke, paths,
+            expected_residues=args.expected_residues, expected_greeting=args.expected_greeting)
+    return _publish(output_dir, data, warn_before_overwrite=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2115,13 +1609,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--demo", action="store_true", help="Offline demo; no AWS account needed")
+    parser.add_argument("--logs", action="store_true", help="Fetch bounded run/engine CloudWatch logs")
+    parser.add_argument("--log-limit", type=int, default=100)
+    parser.add_argument("--analyze-run", action="store_true", help="Invoke optional AWS Run Analyzer")
+    parser.add_argument("--input-format", help="Declared input format to match in workflow recommendations")
+    parser.add_argument("--recommend-engine", choices=["WDL", "CWL", "NEXTFLOW", "WDL_LENIENT"])
+    parser.add_argument("--validate-smoke", choices=["wdl", "esmfold"], help="Validate downloaded synthetic/public smoke outputs")
+    parser.add_argument("--expected-residues", type=int)
+    parser.add_argument("--expected-greeting")
     parser.add_argument("--check", action="store_true",
                         help="Run read-only preflight checks and exit before any live action")
+    parser.add_argument("--live", action="store_true",
+                        help="With --check: inspect the workflow and run prerequisites in AWS")
+    parser.add_argument("--allow-unverified-readiness", action="store_true",
+                        help="Acknowledge required UNKNOWN readiness checks; never overrides FAIL")
     parser.add_argument(
         "--output", type=Path, default=Path("output/healthomics"), help="Output directory"
     )
 
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--resume-from", type=Path, help="Recover the original submission receipt without regenerating its token")
     mode.add_argument("--list-runs", action="store_true", help="List recent runs (read-only)")
     mode.add_argument("--list-workflows", action="store_true", help="List workflows (read-only)")
     mode.add_argument("--run-status", metavar="RUN_ID", help="Report one run (read-only)")
@@ -2251,6 +1758,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _selected_mode(args: argparse.Namespace) -> str:
     for attr, label in (
         ("check", "check"),
+        ("resume_from", "resume"),
         ("list_runs", "runs"),
         ("list_workflows", "workflows"),
         ("run_status", "run"),
@@ -2284,6 +1792,9 @@ def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseExc
         mode=_selected_mode(args),
         region=getattr(args, "region", None),
     )
+    receipt = getattr(args, "_submission_receipt", None)
+    if receipt:
+        payload["submission"] = receipt
     report = generate_report_header(
         title="AWS HealthOmics — Error",
         skill_name=SKILL_NAME,
@@ -2298,6 +1809,8 @@ def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseExc
         f"## Error\n\n`{payload['error_code']}`\n\n{payload['message']}\n\n"
         + generate_report_footer()
     )
+    if receipt:
+        report += f"\nSubmission state: {receipt['state']}; run ID: {receipt.get('run_id')}. See submission.json.\n"
     write_text_lf(output_dir / "report.md", report)
     write_result_json(
         output_dir=output_dir,
@@ -2308,6 +1821,7 @@ def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseExc
             "error_code": payload["error_code"],
             "mode": payload["mode"],
             "region": payload["region"],
+            "run_id": receipt.get("run_id") if receipt else None,
         },
         data=payload,
         datasets={"AWS HealthOmics": "not reached or failed"},
@@ -2319,6 +1833,25 @@ def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseExc
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args._invocation = _submission.replay_invocation(list(argv if argv is not None else sys.argv[1:]))
+    if (args.logs or args.analyze_run) and not (args.run_status or args.resume_from):
+        parser.error("--logs and --analyze-run require --run-status or --resume-from")
+    if not 1 <= args.log_limit <= 1000:
+        parser.error("--log-limit must be between 1 and 1000")
+    if (args.input_format or args.recommend_engine) and not args.recommend_workflow:
+        parser.error("Recommendation filters require --recommend-workflow")
+    if args.validate_smoke and args.verify_outputs != "deep":
+        parser.error("--validate-smoke requires --verify-outputs deep and --confirm-download")
+    if args.validate_smoke == "esmfold" and (not args.expected_residues or args.expected_residues <= 0):
+        parser.error("ESMFold smoke validation requires --expected-residues > 0")
+    if args.validate_smoke == "wdl" and args.expected_greeting is None:
+        parser.error("WDL smoke validation requires --expected-greeting")
+    if args.live and not args.check:
+        parser.error("--live only applies to --check")
+    if args.live and not args.start_run:
+        parser.error("--check --live requires --start-run and its run parameters")
+    if args.allow_unverified_readiness and not args.start_run:
+        parser.error("--allow-unverified-readiness only applies to --start-run")
     output_dir = args.output.expanduser().resolve()
 
     if args.demo:
@@ -2326,7 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result["summary"], indent=2))
         return 0
 
-    if not any([args.check, args.list_runs, args.list_workflows, args.run_status, args.start_run,
+    if not any([args.resume_from, args.check, args.list_runs, args.list_workflows, args.run_status, args.start_run,
                 args.upload_inputs, args.download_outputs, args.register,
                 args.list_run_groups, args.list_run_caches, args.describe_run_group,
                 args.describe_run_cache, args.list_workflow_versions,
@@ -2442,6 +1975,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(json.dumps(result["summary"], indent=2))
+    if result["summary"].get("kind") == "check" and not result["summary"].get("ok"):
+        return 2
     return 0
 
 

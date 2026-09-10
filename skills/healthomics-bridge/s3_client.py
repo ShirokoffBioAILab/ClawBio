@@ -25,14 +25,14 @@ outside the set below is reachable through this client.
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import tempfile
 from typing import Any, Protocol
 
 # The only S3 methods this skill may call, all scoped to a run's own I/O.
 ALLOWED_S3_METHODS = frozenset(
     {
-        # head_object is deliberately absent: list_objects_v2 already returns
-        # each object's size and ETag, so a per-object HEAD would add calls and
-        # reach for a permission this skill has no use for.
+        "head_object",      # inspect an explicitly supplied run input
         "list_objects_v2",  # enumerate a run's output prefix
         "upload_file",      # managed multipart upload of a run input
         "download_file",    # managed multipart download of a run output
@@ -135,10 +135,35 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
+def inspect_run_paths(*, client: S3Client, params: dict[str, Any], output_uri: str) -> list[dict[str, Any]]:
+    """Caller-visible metadata only; never claim this proves role write access."""
+    from preflight import _walk_strings, check
+    from ecr_client import exception_code
+
+    checks = []
+    try:
+        bucket, prefix = parse_s3_uri(output_uri)
+        client.call("list_objects_v2", Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        checks.append(check("output_prefix_listing", "PASS", "Caller can list the output prefix; write access is unverified.", required=False))
+    except Exception as exc:
+        checks.append(check("output_prefix_listing", "UNKNOWN", f"Output inspection: {exception_code(exc)}; caller listing is not execution-role access.", required=False))
+    for uri in sorted({v for v in _walk_strings(params) if v.startswith("s3://")}):
+        try:
+            bucket, key = parse_s3_uri(uri)
+            if not key or key.endswith("/"):
+                checks.append(check("input_metadata", "UNKNOWN", f"{uri}: prefix input, object existence not checked.", required=False))
+                continue
+            client.call("head_object", Bucket=bucket, Key=key)
+            checks.append(check("input_metadata", "PASS", f"{uri}: caller can read object metadata.", required=False))
+        except Exception as exc:
+            checks.append(check("input_metadata", "UNKNOWN", f"{uri}: {exception_code(exc)}; may be a prefix or inaccessible to the caller.", required=False))
+    return checks
+
+
 def describe_etag(etag: str) -> dict[str, Any]:
     """Say what an S3 ETag actually is, rather than implying it is a checksum.
 
-    For a single-part upload the ETag is the object's MD5. For a multipart
+    A single-part ETag alone does not prove MD5 (SSE-KMS/SSE-C differ). For a multipart
     upload it is the MD5 of the concatenated part MD5s, suffixed ``-<n>``,
     which hashes nothing the caller can recompute from the file. Genomic
     outputs are routinely multipart, so labelling this a checksum would put a
@@ -162,9 +187,9 @@ def describe_etag(etag: str) -> dict[str, Any]:
         }
     return {
         "etag": cleaned,
-        "is_md5": True,
+        "is_md5": False,
         "parts": 1,
-        "note": "single-part ETag — equals the object's MD5",
+        "note": "opaque ETag: encryption/upload evidence unavailable; not a verified MD5",
     }
 
 
@@ -226,6 +251,8 @@ def upload_files(
         )
 
     base = prefix.rstrip("/")
+    if len({p.name for p in resolved}) != len(resolved):
+        raise ValueError("Duplicate source basenames would overwrite an input; nothing uploaded.")
     uploaded: list[dict[str, Any]] = []
     for source in resolved:
         key = f"{base}/{source.name}" if base else source.name
@@ -264,16 +291,34 @@ def download_objects(
 
     for item in objects:
         key = item["key"]
-        relative = key[len(key_prefix):] if key.startswith(key_prefix) else Path(key).name
-        if not relative or relative.endswith("/"):
-            continue  # a directory marker, not an object worth fetching
-        target = destination / relative
+        temporary = None
         try:
+            if not key.startswith(key_prefix):
+                raise ValueError("Object is outside the selected run prefix")
+            relative = key[len(key_prefix):]
+            if not relative or relative.endswith("/"):
+                continue
+            if any(p in ("", ".", "..") for p in relative.split("/")) or "\\" in relative:
+                raise ValueError("Unsafe object path")
+            target = destination / relative
+            if not target.resolve().is_relative_to(destination):
+                raise ValueError("Object path escapes destination")
+            if any(p.is_symlink() for p in (target, *target.parents) if p.is_relative_to(destination)):
+                raise ValueError("Symlink in output path")
+            if target.exists():
+                raise FileExistsError("Output already exists; choose a fresh destination")
             target.parent.mkdir(parents=True, exist_ok=True)
-            client.call("download_file", Bucket=bucket, Key=key, Filename=str(target))
+            with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".healthomics-", delete=False) as handle:
+                temporary = Path(handle.name)
+            client.call("download_file", Bucket=bucket, Key=key, Filename=str(temporary))
+            # Publish complete bytes atomically without overwriting an existing file.
+            os.link(temporary, target)
         except Exception as exc:
             failures.append({"key": key, "error": str(exc)})
             continue
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         downloaded.append({"key": key, "path": str(target), "etag": item.get("etag", "")})
 
     return {

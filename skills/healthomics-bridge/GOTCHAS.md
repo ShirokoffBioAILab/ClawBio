@@ -17,9 +17,9 @@ Building on Apple Silicon produces an `arm64` image. HealthOmics compute is
 exec /bin/bash: exec format error
 ```
 
-The failure surfaces from *inside* the container — well past this skill's own
-gates. The request was correct, `--confirm-submit` succeeded, the run started,
-and it still failed. Nothing local can catch it.
+The old preflight missed this before submission. Live readiness now checks
+image manifests/config metadata for linux/amd64. If metadata cannot be read,
+architecture remains UNKNOWN; it is never inferred from the host machine.
 
 ```bash
 docker buildx build --platform linux/amd64 -t <account>.dkr.ecr.<region>.amazonaws.com/<repo>:latest --push .
@@ -64,12 +64,10 @@ aws ecr set-repository-policy --repository-name <repo> --policy-text file://poli
 aws ecr get-repository-policy --repository-name <repo>   # verify
 ```
 
-**This skill will never do that for you.** Setting a repository policy is a
-permission change: its blast radius extends beyond the current task, and it is
-the classic privilege-escalation vector. `put_bucket_policy` and friends are
-barred by name in `s3_client.py`, and the equivalent ECR call is not reachable
-at all. Container build, push and grant are one-time environment setup, not
-per-run work — the boundary is deliberate, not an omission.
+**The bridge inspects these prerequisites but does not change policies.** Its
+ECR adapter can read image metadata and repository policies. Container build,
+push and grants belong to environment setup. Read [READINESS.md](READINESS.md)
+for the distinction between caller access, policy evidence and runtime access.
 
 Verify both *before* `--confirm-submit`. A run that fails on a bad image still
 bills for the compute that never ran your workload.

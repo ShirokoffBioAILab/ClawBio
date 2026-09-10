@@ -14,7 +14,26 @@ _ECR_RE = re.compile(r"\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[^\s\"']+")
 
 
 def _check(name: str, ok: bool, detail: str, severity: str = "error") -> dict[str, Any]:
-    return {"name": name, "ok": ok, "severity": severity, "detail": detail}
+    return check(name, "PASS" if ok else "FAIL", detail, required=severity == "error")
+
+
+def check(name: str, status: str, detail: str, *, required: bool = True,
+          code: str | None = None) -> dict[str, Any]:
+    return {"name": name, "status": status, "ok": status in {"PASS", "NOT_APPLICABLE"},
+            "required": required, "severity": "error" if required else "warning",
+            "detail": detail, "code": code}
+
+
+def summarize(checks: list[dict[str, Any]], *, scope: str = "live",
+              allow_unknown: bool = False) -> dict[str, Any]:
+    failed = [c for c in checks if c["required"] and c["status"] == "FAIL"]
+    unknown = [c for c in checks if c["required"] and c["status"] == "UNKNOWN"]
+    return {"mode": "check", "scope": scope,
+            "ok": not failed and (not unknown or allow_unknown),
+            "checks": checks, "n_checks": len(checks), "n_failed": len(failed),
+            "n_unknown": len(unknown), "unknown_acknowledged": allow_unknown,
+            "n_warnings": sum(c["status"] == "UNKNOWN" or
+                              (not c["required"] and c["status"] == "FAIL") for c in checks)}
 
 
 def _walk_strings(value: Any) -> list[str]:
@@ -71,7 +90,7 @@ def run_preflight(args: Any, *, params: dict[str, Any] | None = None) -> dict[st
     )
     checks.append(_check("region", bool(getattr(args, "region", None)), f"Region: {getattr(args, 'region', None) or 'missing'}"))
     profile = getattr(args, "profile", None)
-    checks.append(_check("profile", True, f"Profile: {profile or 'boto3 default chain'}", "warning"))
+    checks.append(check("profile", "UNKNOWN", f"Configured profile: {profile or 'boto3 default chain'}; credentials not verified locally.", required=False))
 
     local_params = params if params is not None else {}
     if getattr(args, "params", None):
@@ -99,12 +118,12 @@ def run_preflight(args: Any, *, params: dict[str, Any] | None = None) -> dict[st
         )
         images = collect_container_images(local_params)
         checks.append(
-            _check(
+            check(
                 "container_images",
-                True,
+                "UNKNOWN",
                 "Container references found: " + ", ".join(images) if images else
                 "No obvious container image references found in params.",
-                "warning",
+                required=False,
             )
         )
 
@@ -119,13 +138,4 @@ def run_preflight(args: Any, *, params: dict[str, Any] | None = None) -> dict[st
             )
         )
 
-    failed = [c for c in checks if not c["ok"] and c["severity"] == "error"]
-    warnings = [c for c in checks if not c["ok"] and c["severity"] == "warning"]
-    return {
-        "mode": "check",
-        "ok": not failed,
-        "checks": checks,
-        "n_checks": len(checks),
-        "n_failed": len(failed),
-        "n_warnings": len(warnings),
-    }
+    return summarize(checks, scope="local")
