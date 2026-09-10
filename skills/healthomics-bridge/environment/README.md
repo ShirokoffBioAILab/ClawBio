@@ -43,6 +43,12 @@ and BatchCheckLayerAvailability; GetRepositoryPolicy is not a substitute for
 the third action. The live repair caught this omission before submission and
 test_environment.py now guards against it.
 
+The 2026-09-10 live observability retest also found that task logs require
+`logs:DescribeLogStreams` on the HealthOmics log group. The template now grants
+that action alongside log writes, scoped to `/aws/omics/WorkflowLog`. The reviewed
+update changed only the existing execution-role policy, without replacement;
+fresh hello run 4200749 subsequently exposed run, engine and task streams.
+
 ## Retention and Cleanup
 
 S3 and ECR use Retain on deletion/replacement. No automatic object expiration,

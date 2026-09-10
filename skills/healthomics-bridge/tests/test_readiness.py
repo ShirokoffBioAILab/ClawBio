@@ -136,6 +136,8 @@ def test_failed_or_unknown_required_preflight_blocks_start_run(tmp_path, monkeyp
 
 def test_submission_receipt_survives_interrupted_wait(tmp_path, monkeypatch):
     import readiness
+    import submission
+    monkeypatch.setattr(submission, "resolve_identity", lambda **kwargs: {"account": "123456789012", "partition": "aws"})
     args = args_for(tmp_path)
     args.wait = True
     monkeypatch.setattr(bridge, "_live_readiness", lambda *a, **k: readiness.summarize([]))

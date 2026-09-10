@@ -4,6 +4,14 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_execution_role_can_discover_only_healthomics_log_streams():
+    template = yaml.safe_load((ROOT / "environment" / "template.yaml").read_text())
+    statements = template["Resources"]["ExecutionRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+    discovery = [s for s in statements if "logs:DescribeLogStreams" in s["Action"]]
+    assert len(discovery) == 1
+    assert "/aws/omics/WorkflowLog" in discovery[0]["Resource"]["Fn::Sub"]
+
+
 def test_template_grants_the_complete_documented_ecr_pull_actions():
     template = yaml.safe_load((ROOT / "environment" / "template.yaml").read_text())
     statement = template["Resources"]["Images"]["Properties"]["RepositoryPolicyText"]["Statement"][0]

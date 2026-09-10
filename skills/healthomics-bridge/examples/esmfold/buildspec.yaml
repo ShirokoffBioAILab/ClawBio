@@ -1,0 +1,21 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --no-cache-dir huggingface_hub==0.34.4
+  pre_build:
+    commands:
+      - python prepare_model.py
+      - aws s3 cp model.tar "$MODEL_PREFIX/model.tar" --only-show-errors
+      - aws s3 cp model-provenance.json "$MODEL_PREFIX/model-provenance.json" --only-show-errors
+      - aws ecr get-login-password | docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+  build:
+    commands:
+      - docker build --provenance=false -t "$REPOSITORY_URI:esmfold-20260910" .
+      - docker run --rm "$REPOSITORY_URI:esmfold-20260910" python -c "from transformers import EsmForProteinFolding; import torch; print(torch.__version__)"
+      - docker push "$REPOSITORY_URI:esmfold-20260910"
+  post_build:
+    commands:
+      - docker logout "${REPOSITORY_URI%%/*}"

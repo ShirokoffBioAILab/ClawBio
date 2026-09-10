@@ -1,18 +1,23 @@
 # Complete CLI Reference
 
-Generated from the current parser on 2026-09-05. No command below is executed by reading this document.
+Parser reference updated on 2026-09-10. No command below is executed by reading this document.
 Confirmation flags remain explicit. Environment-dependent defaults are described below.
 
 | Flag | Purpose / Choices | Default |
 |---|---|---|
 | `--demo` | Offline demo; no AWS account needed | `False` |
+| `--strict-exit` | Failed execution: 3; incomplete execution/timeout: 4. Explicit smoke failure always returns 5. | `False` |
 | `--logs` | Fetch bounded run/engine CloudWatch logs | `False` |
 | `--log-limit` | See operational details below. | `100` |
+| `--log-cursors` | Previous logs.json for the same run/profile/region | `None` |
+| `--log-start-time-ms` | Inclusive UTC epoch-millisecond start | `None` |
+| `--log-end-time-ms` | Exclusive UTC epoch-millisecond end | `None` |
 | `--analyze-run` | Invoke optional AWS Run Analyzer | `False` |
 | `--input-format` | Declared input format to match in workflow recommendations | `None` |
 | `--recommend-engine` | See operational details below. Choices: WDL, CWL, NEXTFLOW, WDL_LENIENT | `None` |
 | `--validate-smoke` | Validate downloaded synthetic/public smoke outputs Choices: wdl, esmfold | `None` |
 | `--expected-residues` | See operational details below. | `None` |
+| `--expected-sequence` | Exact canonical amino-acid sequence for ESMFold output validation | `None` |
 | `--expected-greeting` | See operational details below. | `None` |
 | `--check` | Run read-only preflight checks and exit before any live action | `False` |
 | `--live` | With --check: inspect the workflow and run prerequisites in AWS | `False` |

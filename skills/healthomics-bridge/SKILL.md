@@ -110,11 +110,12 @@ run diagnosis; they do not provide a dollar-denominated spending cap.
 - Offline demo and local validation; live fail-closed readiness before submission.
 - Explicit PRIVATE/READY2RUN type, workflow version, image/resource provenance.
 - Complete task pagination and bounded failed-task enrichment.
-- Versioned durable submission receipt, journal and token-preserving recovery.
+- Account/partition-bound submission receipt, journal and token-preserving recovery.
 - Safe atomic downloads, opaque ETags and local SHA-256 fingerprints.
 - Conservative VCF sample/reference handoffs; public/synthetic smoke assertions.
 - Contextual recommendations, parameter templates and run tags.
-- Bounded run/engine logs and optional AWS Run Analyzer adapter.
+- Bounded run/engine/task logs with cursors and optional AWS Run Analyzer adapter.
+- Unified hello-WDL, GIAB and private ESMFold smoke harness with strict exit codes.
 
 ## Workflow
 
@@ -182,6 +183,8 @@ The offline command above produces `report.md`, `result.json` and task tables.
 Historical real outputs are in [EXAMPLE.md](EXAMPLE.md); their success does not
 prove the environment still exists. [COMPARISON.md](COMPARISON.md) separates
 peer comparisons, test evidence and remaining limitations.
+The [2026-09-10 retest](LIVE_RETEST_20260910.md) records fresh CPU runs, recovery,
+logging repairs and the still-pending private ESMFold execution.
 
 Historical captured run excerpt (not a newly submitted run):
 
@@ -194,6 +197,9 @@ Tasks: 2 completed, 0 failed
 ```
 
 This is Ready2Run evidence only. It does not validate a private ESMFold workflow.
+The separate [private ESMFold example](examples/esmfold/README.md) documents the
+pinned model, explicit build boundary, budget plan and validation contract;
+preparation alone must not be presented as a successful GPU run.
 
 A real public CPU example is available in [GIAB variant QC](examples/giab/README.md):
 a private WDL subsets the versioned HG002 benchmark and checks its results against
@@ -243,8 +249,9 @@ or run its offline demo.
 - Existing download files and symlink paths are refused. Use a fresh destination.
 - ETags are opaque without upload/encryption evidence. A local SHA-256 identifies
   downloaded bytes; it is not automatically verified against an AWS checksum.
-- Receipt checksums detect accidental changes, not malicious edits. Profile/region
-  matching is not proof that a profile still resolves to the original account.
+- Receipt checksums detect accidental changes, not malicious edits. New receipts
+  bind the STS-resolved account/partition; recovery rechecks them as well as
+  profile/region. Legacy unbound receipts require manual run-ID inspection.
 - Include: ClawBio is a research and educational tool. It is not a medical device
   and does not provide clinical diagnoses. Consult a healthcare professional
   before making any medical decisions.
@@ -253,7 +260,7 @@ or run its offline demo.
 
 - You will want to substitute Ready2Run ESMFold when PRIVATE is requested. Do not.
 - You will want to treat exit 0 as execution success. Do not: inspect `summary.execution_ok`,
-  `summary.run_status` and `smoke_validation.json`.
+  `summary.run_status` and `smoke_validation.json`, or use `--strict-exit` in automation.
 - You will want to retry an uncertain submission with a fresh token. Do not. Inspect AWS runs and
   use the original receipt; idempotency is not an indefinite guarantee.
 - Do not widen ECR policies merely to get PASS; scoped conditions are supported.

@@ -1280,6 +1280,7 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
 
     if args.resume_from:
         receipt = _submission.load_receipt(args.resume_from, profile=args.profile, region=args.region)
+        _submission.verify_identity(receipt, _submission.resolve_identity(profile=args.profile, region=args.region))
         args._submission_receipt = receipt
         client = OmicsOperations(_boto=build_boto_client(args.region, args.profile))
         if not receipt.get("run_id"):
@@ -1522,7 +1523,8 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
             return _publish(output_dir, data, warn_before_overwrite=False)
         if prepare_start_request(args) != start_run_request:
             raise ValueError("Run parameters changed during readiness inspection; build a fresh plan.")
-        receipt = _submission.make_receipt(start_run_request, profile=args.profile, region=args.region)
+        receipt = _submission.make_receipt(start_run_request, profile=args.profile, region=args.region,
+            identity=_submission.resolve_identity(profile=args.profile, region=args.region))
         _submission.save_receipt(output_dir / "submission.json", receipt)
         args._submission_receipt = receipt
         result = submit_run(client=client, request=start_run_request, confirmed=True)
@@ -1585,9 +1587,17 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     data["profile"] = args.profile
     if args.logs:
         try:
+            cursors = {}
+            if args.log_cursors:
+                previous = json.loads(args.log_cursors.read_text())
+                if (previous.get("run_id"), previous.get("region"), previous.get("profile")) != (str(run_id), args.region, args.profile):
+                    raise ValueError("Log cursor context differs from this run/profile/region")
+                cursors = previous.get("cursors", {})
             data["logs"] = _observability.fetch_run_logs(
                 client=_observability.build_logs_client(args.region, args.profile),
-                run=bundle["run"], limit=args.log_limit)
+                run=bundle["run"], tasks=bundle.get("tasks", []), limit=args.log_limit,
+                cursors=cursors, start_time=args.log_start_time_ms, end_time=args.log_end_time_ms)
+            data["logs"].update(region=args.region, profile=args.profile)
         except Exception as exc:
             data["logs"] = {"status": "UNAVAILABLE", "reason": _ecr.exception_code(exc)}
     if args.analyze_run:
@@ -1596,7 +1606,8 @@ def _run_live(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     if args.validate_smoke:
         paths = [Path(item["local_path"]) for item in (verification or {}).get("objects", []) if item.get("local_path")]
         data["smoke_validation"] = _outputs.validate_smoke_outputs(args.validate_smoke, paths,
-            expected_residues=args.expected_residues, expected_greeting=args.expected_greeting)
+            expected_residues=args.expected_residues, expected_greeting=args.expected_greeting,
+            expected_sequence=args.expected_sequence)
     return _publish(output_dir, data, warn_before_overwrite=False)
 
 
@@ -1609,13 +1620,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--demo", action="store_true", help="Offline demo; no AWS account needed")
+    parser.add_argument("--strict-exit", action="store_true", help="Exit 3 on failed execution, 4 if incomplete; validation failures always exit 5")
     parser.add_argument("--logs", action="store_true", help="Fetch bounded run/engine CloudWatch logs")
     parser.add_argument("--log-limit", type=int, default=100)
+    parser.add_argument("--log-cursors", type=Path, help="Previous logs.json for incremental retrieval")
+    parser.add_argument("--log-start-time-ms", type=int)
+    parser.add_argument("--log-end-time-ms", type=int)
     parser.add_argument("--analyze-run", action="store_true", help="Invoke optional AWS Run Analyzer")
     parser.add_argument("--input-format", help="Declared input format to match in workflow recommendations")
     parser.add_argument("--recommend-engine", choices=["WDL", "CWL", "NEXTFLOW", "WDL_LENIENT"])
     parser.add_argument("--validate-smoke", choices=["wdl", "esmfold"], help="Validate downloaded synthetic/public smoke outputs")
     parser.add_argument("--expected-residues", type=int)
+    parser.add_argument("--expected-sequence", help="Exact canonical amino-acid sequence for ESMFold output validation")
     parser.add_argument("--expected-greeting")
     parser.add_argument("--check", action="store_true",
                         help="Run read-only preflight checks and exit before any live action")
@@ -1830,6 +1846,22 @@ def _write_error_bundle(output_dir: Path, args: argparse.Namespace, exc: BaseExc
     )
 
 
+def result_exit_code(result: dict[str, Any], *, strict: bool = False) -> int:
+    summary = result.get("summary", {})
+    if summary.get("kind") == "check" and not summary.get("ok"):
+        return 2
+    validation = result.get("data", {}).get("smoke_validation")
+    if validation is not None and not validation.get("ok"):
+        return 5
+    if strict and summary.get("run_status"):
+        status = summary["run_status"]
+        if status in {"FAILED", "CANCELLED", "DELETED"}:
+            return 3
+        if status != "COMPLETED":
+            return 4
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1838,6 +1870,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--logs and --analyze-run require --run-status or --resume-from")
     if not 1 <= args.log_limit <= 1000:
         parser.error("--log-limit must be between 1 and 1000")
+    if (args.log_cursors or args.log_start_time_ms is not None or args.log_end_time_ms is not None) and not args.logs:
+        parser.error("Log cursors/time bounds require --logs")
+    if ((args.log_start_time_ms is not None and args.log_start_time_ms < 0) or
+        (args.log_end_time_ms is not None and args.log_end_time_ms <= (args.log_start_time_ms or 0))):
+        parser.error("Invalid log time window")
     if (args.input_format or args.recommend_engine) and not args.recommend_workflow:
         parser.error("Recommendation filters require --recommend-workflow")
     if args.validate_smoke and args.verify_outputs != "deep":
@@ -1972,12 +2009,12 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         print(f"ERROR: {exc}", file=sys.stderr)
+        if args.strict_exit and isinstance(exc, TimeoutError):
+            return 4
         return 1
 
     print(json.dumps(result["summary"], indent=2))
-    if result["summary"].get("kind") == "check" and not result["summary"].get("ok"):
-        return 2
-    return 0
+    return result_exit_code(result, strict=args.strict_exit)
 
 
 if __name__ == "__main__":

@@ -27,11 +27,15 @@ readiness block; the report and structured checks explain why.
 | ECR image | DescribeImages resolves the requested image; missing repository/image is FAIL, caller permission denial is UNKNOWN |
 | Image architecture | Manifest-index platforms or digest-verified config metadata establish linux/amd64; unavailable metadata is UNKNOWN |
 | Repository policy | Explicit service-principal pull grants with supported matching SourceArn/SourceAccount conditions are evidence only; denies, unsupported semantics or missing/mismatched context remain UNKNOWN |
-| S3 paths | HEAD on explicit input objects and bounded output-prefix listing use caller credentials, not the execution role |
+| Typed WDL File inputs | Supplied File leaves (including nested values) and supported literal defaults require object HEAD evidence; a missing object is FAIL, denied/inconclusive access is UNKNOWN |
+| S3 paths | Untyped string/prefix metadata and bounded output-prefix listing use caller credentials, not the execution role; these remain advisory |
 | Effective permissions | Execution-role, service-principal, SCP, KMS and networking authorization remain advisory UNKNOWN |
 
-S3 metadata failures are advisory: a parameter may represent a prefix, and the
-caller and execution role can have different access. PASS means the named check
+S3 metadata failures for untyped strings remain advisory: a parameter may represent
+a prefix. Typed File inputs are required checks, including defaults; a typed prefix
+is invalid. Optional absent inputs are skipped. Complex default expressions and
+unsupported File URI schemes remain UNKNOWN, never silently exempt. The caller
+and execution role can still have different access. PASS means the named check
 passed, never that AWS guarantees a successful run. An ACTIVE workflow also does
 not establish that its image still exists.
 
@@ -82,6 +86,12 @@ The bridge writes `readiness.json` before submission and atomically writes
 immediately, followed by an initial report, before monitoring begins.
 `run_state.json` checkpoints observations during `--wait`.
 
+New schema-3 receipts store the STS-resolved AWS account and partition before
+StartRun. Recovery compares these with the current caller before any Omics call.
+Credential rotation within the same account is allowed; switching the profile to
+another account/partition is refused. Schema-1/2 receipts can be inspected locally
+but are not automatically recovered: use their recorded run ID with `--run-status`.
+
 After a terminal/session interruption, resume with `--run-status RUN_ID --wait`
 and the original profile/region in a new output directory. Never infer that a
 lost terminal stopped an AWS run. If the receipt remains SUBMITTING without an
@@ -96,6 +106,9 @@ inspect/resume by recorded run ID. Use a new run name for intentional reruns.
 For compatibility the result envelope's `ok` still denotes successful reporting.
 Run summaries add `report_ok`, nullable `execution_ok`, and AWS `failure_reason`.
 A FAILED run with zero tasks is a failed execution, not a successful empty run.
+Opt-in `--strict-exit` returns 3 for failed/cancelled/deleted execution and 4 for
+nonterminal execution or observation timeout. Readiness blocks return 2; explicit
+smoke-validation failure returns 5 even without strict mode. Generic errors return 1.
 
 ## Regression and live validation
 

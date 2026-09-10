@@ -515,7 +515,7 @@ SKILLS = {
         "description": "AWS HealthOmics bridge with allowlisted boto3/S3 calls, egress gates, cost gates, workflow registration and output handoff",
         "default_timeout_seconds": 3900,
         "allowed_extra_flags": {
-            "--live", "--allow-unverified-readiness",
+            "--live", "--allow-unverified-readiness", "--strict-exit",
             "--check", "--list-runs", "--list-workflows", "--list-run-groups",
             "--list-run-caches", "--confirm-upload", "--confirm-download",
             "--confirm-register", "--allow-duplicate-name", "--wait",
@@ -533,10 +533,11 @@ SKILLS = {
             "--run-tags", "--region", "--profile", "--limit", "--poll-interval",
             "--wait-timeout-seconds", "--verify-outputs", "--logs", "--log-limit",
             "--analyze-run", "--input-format", "--recommend-engine", "--validate-smoke",
-            "--expected-residues", "--expected-greeting",
+            "--expected-residues", "--expected-sequence", "--expected-greeting", "--log-cursors",
+            "--log-start-time-ms", "--log-end-time-ms",
         },
         "allowed_extra_flags_without_values": {
-            "--live", "--allow-unverified-readiness",
+            "--live", "--allow-unverified-readiness", "--strict-exit",
             "--logs", "--analyze-run",
             "--check", "--list-runs", "--list-workflows", "--list-run-groups",
             "--list-run-caches", "--confirm-upload", "--confirm-download",

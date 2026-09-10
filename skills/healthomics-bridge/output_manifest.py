@@ -38,7 +38,8 @@ def describe_output(entry: dict[str, Any], *, provenance: dict[str, Any]) -> dic
 
 
 def validate_smoke_outputs(kind: str, paths: list[Path], *, expected_residues: int | None = None,
-                           expected_greeting: str | None = None) -> dict[str, Any]:
+                           expected_greeting: str | None = None,
+                           expected_sequence: str | None = None) -> dict[str, Any]:
     """Structural sanity only, never a claim of scientific prediction accuracy."""
     checks = []
     if kind == "wdl":
@@ -51,6 +52,7 @@ def validate_smoke_outputs(kind: str, paths: list[Path], *, expected_residues: i
         if expected_residues is None or expected_residues <= 0:
             raise ValueError("ESMFold validation requires the expected input residue count")
         from Bio.PDB import PDBParser, MMCIFParser
+        from Bio.SeqUtils import seq1
         for path in paths:
             if path.suffix.lower() not in (".pdb", ".cif"):
                 continue
@@ -58,12 +60,17 @@ def validate_smoke_outputs(kind: str, paths: list[Path], *, expected_residues: i
                 parser = PDBParser(QUIET=True) if path.suffix.lower() == ".pdb" else MMCIFParser(QUIET=True)
                 structure = parser.get_structure("smoke", str(path))
                 residues = [r for r in structure.get_residues() if r.id[0] == " "]
+                sequence = "".join(seq1(r.resname) for r in residues)
+                sequence_ok = expected_sequence is None or sequence == expected_sequence
+                backbone_ok = all("CA" in residue for residue in residues)
                 atoms = list(structure.get_atoms())
                 finite = bool(atoms) and all(math.isfinite(float(v)) for atom in atoms
                                             for v in (*atom.coord, atom.bfactor))
                 checks.append({"path": str(path), "residues": len(residues),
+                               "sequence": sequence, "sequence_checked": expected_sequence is not None,
+                               "sequence_ok": sequence_ok, "alpha_carbons_present": backbone_ok,
                                "finite_coordinates_and_b_factors": finite,
-                               "ok": finite and len(residues) == expected_residues})
+                               "ok": finite and backbone_ok and sequence_ok and len(residues) == expected_residues})
             except Exception as exc:
                 checks.append({"path": str(path), "ok": False, "error": type(exc).__name__})
     else:

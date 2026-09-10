@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Explicitly approved single ESMFold image/model preparation; no workflow execution.
+Parameters:
+  Bucket:
+    Type: String
+  Repository:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: clawbio-esmfold-prepare-20260910
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: {Ref: 'AWS::AccountId'}
+              ArnEquals:
+                aws:SourceArn: {Fn::Sub: 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}'}
+      Policies:
+        - PolicyName: OwnedModelAndImageOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:GetObjectVersion']
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:s3:::${Bucket}/inputs/esmfold-20260910/source.zip'}
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:AbortMultipartUpload']
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:s3:::${Bucket}/inputs/esmfold-20260910/*'}
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: ['ecr:BatchCheckLayerAvailability', 'ecr:InitiateLayerUpload', 'ecr:UploadLayerPart', 'ecr:CompleteLayerUpload', 'ecr:PutImage', 'ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer']
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${Repository}'}
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: {Fn::Sub: 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*'}
+  Builder:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: {Ref: ProjectName}
+      ServiceRole: {Fn::GetAtt: [Role, Arn]}
+      TimeoutInMinutes: 20
+      QueuedTimeoutInMinutes: 5
+      ConcurrentBuildLimit: 1
+      Artifacts: {Type: NO_ARTIFACTS}
+      Source:
+        Type: S3
+        Location: {Fn::Sub: '${Bucket}/inputs/esmfold-20260910/source.zip'}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: {Fn::Sub: '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}'}
+          - Name: MODEL_PREFIX
+            Value: {Fn::Sub: 's3://${Bucket}/inputs/esmfold-20260910'}
+      Tags:
+        - Key: purpose
+          Value: healthomics-esmfold-smoke

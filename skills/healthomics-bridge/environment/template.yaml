@@ -84,7 +84,7 @@ Resources:
                 Action: ['s3:GetObject', 's3:PutObject', 's3:AbortMultipartUpload', 's3:ListMultipartUploadParts']
                 Resource: {Fn::Sub: '${Artifacts.Arn}/outputs/*'}
               - Effect: Allow
-                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams']
                 Resource: {Fn::Sub: 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/omics/WorkflowLog:*'}
       Tags:
         - Key: owner

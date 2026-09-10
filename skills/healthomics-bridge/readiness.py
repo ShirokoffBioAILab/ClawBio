@@ -45,7 +45,7 @@ def _local_name(value: str) -> str:
     return str(path)
 
 
-def _wdl_images(definitions: dict[str, str], main: str, params: dict[str, Any]) -> tuple[set[str], bool]:
+def _load_wdl(definitions: dict[str, str], main: str):
     import WDL
 
     async def read_source(uri, path, importer):
@@ -54,7 +54,57 @@ def _wdl_images(definitions: dict[str, str], main: str, params: dict[str, Any]) 
             name = _local_name(str(PurePosixPath(importer.pos.abspath).parent / name))
         return WDL.Tree.ReadSourceResult(definitions[name], name)
 
-    doc = WDL.load(_local_name(main), read_source=read_source, import_max_depth=10)
+    return WDL.load(_local_name(main), read_source=read_source, import_max_depth=10)
+
+
+def workflow_file_inputs(workflow: dict[str, Any], params: dict[str, Any]) -> tuple[set[str], bool]:
+    """Resolve supplied/default File leaves using archive-local WDL types only."""
+    import json
+    import WDL
+    files: set[str] = set()
+    try:
+        main = workflow.get("main") or "main.wdl"
+        doc = _load_wdl(_definitions(workflow["definition"], main), main)
+        target = doc.workflow or doc.tasks[0]
+        stdlib = WDL.StdLib.Base(doc.effective_wdl_version)
+        env = WDL.Env.Bindings()
+        complete = True
+        for binding in target.available_inputs:
+            name, decl = binding.name, binding.value
+            value = params.get(name, params.get(target.name + "." + name))
+            if value is not None:
+                if not isinstance(decl.type, (WDL.Type.String, WDL.Type.File)):
+                    value = json.loads(value) if isinstance(value, str) else value
+                resolved = WDL.Value.from_json(decl.type, value)
+            elif decl.expr is not None:
+                # Only literals here: no defaults that perform I/O or execute functions.
+                if not isinstance(decl.expr, (WDL.Expr.String, WDL.Expr.Int, WDL.Expr.Boolean)):
+                    complete = False
+                    continue
+                if any(isinstance(c, WDL.Expr.Placeholder) for c in decl.expr.children):
+                    complete = False
+                    continue
+                resolved = decl.expr.eval(env, stdlib=stdlib).coerce(decl.type)
+            elif decl.type.optional:
+                continue
+            else:
+                complete = False
+                continue
+            env = env.bind(name, resolved)
+            def collect(v):
+                if isinstance(v, WDL.Value.File):
+                    files.add(v.value)
+                for child in v.children:
+                    collect(child)
+            collect(resolved)
+        return files, complete
+    except Exception:
+        return files, False
+
+
+def _wdl_images(definitions: dict[str, str], main: str, params: dict[str, Any]) -> tuple[set[str], bool]:
+    import WDL
+    doc = _load_wdl(definitions, main)
     stdlib = WDL.StdLib.Base(doc.effective_wdl_version)
     images: set[str] = set()
     complete = True
@@ -255,7 +305,13 @@ def run_live_preflight(args: Any, *, omics: Any, ecr: Any, s3: Any) -> dict[str,
                                                    source_arn=source_arn, source_account=source_account))
     else:
         checks.append(check("container_inventory", "NOT_APPLICABLE", "Ready2Run containers are managed by AWS."))
-    checks.extend(s3_client.inspect_run_paths(client=s3, params=params, output_uri=args.output_uri))
+    file_uris: set[str] = set()
+    if workflow.get("engine") == "WDL" and args.workflow_type == "PRIVATE":
+        file_uris, complete = workflow_file_inputs(workflow, params)
+        checks.append(check("file_input_inventory", "PASS" if complete else "UNKNOWN",
+                            f"{len(file_uris)} typed File input(s); resolution {'complete' if complete else 'incomplete'}."))
+    checks.extend(s3_client.inspect_run_paths(client=s3, params=params, output_uri=args.output_uri,
+                                            file_uris=file_uris))
     checks.append(check("effective_execution_permissions", "UNKNOWN",
                         "Read-only caller checks cannot prove execution-role, service-principal, SCP, KMS or network access at runtime.", required=False))
     result = summarize(checks, allow_unknown=allow_unknown)

@@ -135,7 +135,8 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
-def inspect_run_paths(*, client: S3Client, params: dict[str, Any], output_uri: str) -> list[dict[str, Any]]:
+def inspect_run_paths(*, client: S3Client, params: dict[str, Any], output_uri: str,
+                      file_uris: set[str] | None = None) -> list[dict[str, Any]]:
     """Caller-visible metadata only; never claim this proves role write access."""
     from preflight import _walk_strings, check
     from ecr_client import exception_code
@@ -147,16 +148,24 @@ def inspect_run_paths(*, client: S3Client, params: dict[str, Any], output_uri: s
         checks.append(check("output_prefix_listing", "PASS", "Caller can list the output prefix; write access is unverified.", required=False))
     except Exception as exc:
         checks.append(check("output_prefix_listing", "UNKNOWN", f"Output inspection: {exception_code(exc)}; caller listing is not execution-role access.", required=False))
-    for uri in sorted({v for v in _walk_strings(params) if v.startswith("s3://")}):
+    file_uris = file_uris or set()
+    for uri in sorted({v for v in _walk_strings(params) if v.startswith("s3://")} | file_uris):
+        required = uri in file_uris
         try:
+            if required and not uri.startswith("s3://"):
+                checks.append(check("input_metadata", "UNKNOWN", f"{uri}: typed File uses unsupported storage URI."))
+                continue
             bucket, key = parse_s3_uri(uri)
             if not key or key.endswith("/"):
-                checks.append(check("input_metadata", "UNKNOWN", f"{uri}: prefix input, object existence not checked.", required=False))
+                checks.append(check("input_metadata", "FAIL" if required else "UNKNOWN", f"{uri}: prefix input, object existence not checked.", required=required))
                 continue
             client.call("head_object", Bucket=bucket, Key=key)
-            checks.append(check("input_metadata", "PASS", f"{uri}: caller can read object metadata.", required=False))
+            checks.append(check("input_metadata", "PASS", f"{uri}: caller can read object metadata.", required=required))
         except Exception as exc:
-            checks.append(check("input_metadata", "UNKNOWN", f"{uri}: {exception_code(exc)}; may be a prefix or inaccessible to the caller.", required=False))
+            code = exception_code(exc)
+            absent = code in {"404", "NoSuchKey", "NotFound", "NoSuchBucket"}
+            checks.append(check("input_metadata", "FAIL" if required and absent else "UNKNOWN",
+                                f"{uri}: {code}; {'required File missing' if required and absent else 'access/existence unverified'}.", required=required))
     return checks
 
 
